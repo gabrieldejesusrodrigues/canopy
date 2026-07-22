@@ -10,7 +10,7 @@
   },
   "build": {
     "buildCommand": null,
-    "testCommand": null,
+    "testCommand": "export PATH=\"$HOME/.cargo/bin:$PATH\" && cargo test 2>&1 | tail -15",
     "lintCommand": null,
     "devCommand": null,
     "scripts": {}
@@ -44,39 +44,195 @@
   },
   "hotPaths": [
     {
+      "path": "src/agent/stub.rs",
+      "accessCount": 14,
+      "lastAccessed": 1784726989558,
+      "type": "file"
+    },
+    {
+      "path": "src/main.rs",
+      "accessCount": 11,
+      "lastAccessed": 1784727191981,
+      "type": "file"
+    },
+    {
+      "path": "src/tracker/linear.rs",
+      "accessCount": 7,
+      "lastAccessed": 1784727005027,
+      "type": "file"
+    },
+    {
+      "path": "src/scheduler.rs",
+      "accessCount": 6,
+      "lastAccessed": 1784727234864,
+      "type": "file"
+    },
+    {
       "path": "Cargo.toml",
-      "accessCount": 2,
-      "lastAccessed": 1784726265886,
+      "accessCount": 4,
+      "lastAccessed": 1784726547186,
       "type": "file"
     },
     {
       "path": "src/model.rs",
-      "accessCount": 1,
-      "lastAccessed": 1784726249365,
+      "accessCount": 4,
+      "lastAccessed": 1784726571139,
       "type": "file"
     },
     {
-      "path": "src/config.rs",
-      "accessCount": 1,
-      "lastAccessed": 1784726289538,
+      "path": "docs/DESIGN.md",
+      "accessCount": 3,
+      "lastAccessed": 1784726570537,
       "type": "file"
     },
     {
-      "path": "src/tracker/mod.rs",
-      "accessCount": 1,
-      "lastAccessed": 1784726309358,
-      "type": "file"
-    },
-    {
-      "path": "src/agent/mod.rs",
-      "accessCount": 1,
-      "lastAccessed": 1784726320084,
+      "path": "src/gitops.rs",
+      "accessCount": 3,
+      "lastAccessed": 1784726929652,
       "type": "file"
     },
     {
       "path": "docs/research/linear-graphql.md",
+      "accessCount": 2,
+      "lastAccessed": 1784726517443,
+      "type": "file"
+    },
+    {
+      "path": "src/tracker/mod.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784726524802,
+      "type": "file"
+    },
+    {
+      "path": "src/config.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784726524966,
+      "type": "file"
+    },
+    {
+      "path": "src/agent/mod.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784726547157,
+      "type": "file"
+    },
+    {
+      "path": "docs/MECHANISMS.md",
+      "accessCount": 2,
+      "lastAccessed": 1784726571099,
+      "type": "file"
+    },
+    {
+      "path": "src/tracker/sqlite.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784726855241,
+      "type": "file"
+    },
+    {
+      "path": "src/mechanisms/megafile.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784727236733,
+      "type": "file"
+    },
+    {
+      "path": "docs/research/cli-contracts.md",
       "accessCount": 1,
-      "lastAccessed": 1784726381247,
+      "lastAccessed": 1784726543664,
+      "type": "file"
+    },
+    {
+      "path": "src/agent/claude.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726582102,
+      "type": "file"
+    },
+    {
+      "path": "src/agent/codex.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726613406,
+      "type": "file"
+    },
+    {
+      "path": "prompts/planner.md",
+      "accessCount": 1,
+      "lastAccessed": 1784726617316,
+      "type": "file"
+    },
+    {
+      "path": "src/agent/agy.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726629836,
+      "type": "file"
+    },
+    {
+      "path": "prompts/executor.md",
+      "accessCount": 1,
+      "lastAccessed": 1784726640934,
+      "type": "file"
+    },
+    {
+      "path": "prompts/merger.md",
+      "accessCount": 1,
+      "lastAccessed": 1784726655399,
+      "type": "file"
+    },
+    {
+      "path": "prompts/reconciler.md",
+      "accessCount": 1,
+      "lastAccessed": 1784726672990,
+      "type": "file"
+    },
+    {
+      "path": "prompts/decomposer.md",
+      "accessCount": 1,
+      "lastAccessed": 1784726688456,
+      "type": "file"
+    },
+    {
+      "path": "prompts/reviewer_transcript.md",
+      "accessCount": 1,
+      "lastAccessed": 1784726705015,
+      "type": "file"
+    },
+    {
+      "path": "src/mechanisms/mod.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726707015,
+      "type": "file"
+    },
+    {
+      "path": "prompts/reviewer_output.md",
+      "accessCount": 1,
+      "lastAccessed": 1784726719987,
+      "type": "file"
+    },
+    {
+      "path": "prompts/reviewer_codebase.md",
+      "accessCount": 1,
+      "lastAccessed": 1784726737595,
+      "type": "file"
+    },
+    {
+      "path": "src/mechanisms/designdocs.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726745952,
+      "type": "file"
+    },
+    {
+      "path": "src/mechanisms/fieldguide.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726781112,
+      "type": "file"
+    },
+    {
+      "path": "src/ledger.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726814306,
+      "type": "file"
+    },
+    {
+      "path": "src/prompt.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726839908,
       "type": "file"
     }
   ],
