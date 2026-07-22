@@ -44,10 +44,17 @@
       "status": "completed",
       "completed_at": "2026-07-22T13:26:03.672Z",
       "duration_ms": 196041
+    },
+    {
+      "agent_id": "abeafe3bd5d184aed",
+      "agent_type": "codex:codex-rescue",
+      "started_at": "2026-07-22T13:40:34.652Z",
+      "parent_mode": "none",
+      "status": "running"
     }
   ],
-  "total_spawned": 6,
+  "total_spawned": 7,
   "total_completed": 6,
   "total_failed": 0,
-  "last_updated": "2026-07-22T13:30:45.280Z"
+  "last_updated": "2026-07-22T13:40:34.756Z"
 }

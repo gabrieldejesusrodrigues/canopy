@@ -92,6 +92,12 @@
       "type": "file"
     },
     {
+      "path": "docs/MECHANISMS.md",
+      "accessCount": 3,
+      "lastAccessed": 1784727707107,
+      "type": "file"
+    },
+    {
       "path": "docs/research/linear-graphql.md",
       "accessCount": 2,
       "lastAccessed": 1784726517443,
@@ -113,12 +119,6 @@
       "path": "src/agent/mod.rs",
       "accessCount": 2,
       "lastAccessed": 1784726547157,
-      "type": "file"
-    },
-    {
-      "path": "docs/MECHANISMS.md",
-      "accessCount": 2,
-      "lastAccessed": 1784726571099,
       "type": "file"
     },
     {
@@ -239,6 +239,12 @@
       "path": "src/e2e.rs",
       "accessCount": 1,
       "lastAccessed": 1784727512702,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 1,
+      "lastAccessed": 1784727672538,
       "type": "file"
     }
   ],

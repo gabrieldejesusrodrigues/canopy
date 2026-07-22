@@ -106,10 +106,12 @@ work being audited."
 | `codebase` | repo tree + touched files at HEAD, no history |
 
 Lenses are configured with *different CLIs/models on purpose* (decorrelation across
-vendors, not just prompts). Findings come back as structured JSON with severity;
-`high` blocks the node's `Done` transition and spawns a fix node, `low` lands as a
-backlog node. Reviews use cheap models by default — the article's point is that many
-cheap uncorrelated lenses beat one expensive one.
+vendors, not just prompts). Findings come back as structured JSON with severity.
+`high` findings spawn a fix node **under the same parent** — the reviewed node itself
+moves on, but its subtree cannot complete until the debt is paid, which is where
+"blocking" actually materializes (re-executing an already-merged node would be wrong).
+`low` findings land as comments on the node. Reviews use cheap models by default — the
+article's point is that many cheap uncorrelated lenses beat one expensive one.
 
 ## 7. Field Guide → stigmergy
 
