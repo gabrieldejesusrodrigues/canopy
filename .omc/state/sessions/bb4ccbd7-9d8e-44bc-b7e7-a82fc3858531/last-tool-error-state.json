@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"ls ~/.gemini/ 2>/dev/null; echo ====; ls ~/.gemini/antigravity* 2>/dev/null; find ~/.gemini -maxdepth 2 -name '*.json' 2>/dev/null | head; echo ====AGENTS====; ls ~/.agents 2>/dev/null | h...",
+  "error": "Exit code 1\nantigravity-cli\nconfig\ngoogle_accounts.json\nhistory\ninstallation_id\noauth_creds.json\nprojects.json\nsettings.json\nstate.json\ntmp\ntrustedFolders.json\n(eval):1: === not found",
+  "timestamp": "2026-07-22T13:17:41.103Z",
+  "retry_count": 1
+}

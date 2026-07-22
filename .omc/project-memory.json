@@ -42,6 +42,43 @@
       ]
     }
   },
-  "hotPaths": [],
+  "hotPaths": [
+    {
+      "path": "Cargo.toml",
+      "accessCount": 2,
+      "lastAccessed": 1784726265886,
+      "type": "file"
+    },
+    {
+      "path": "src/model.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726249365,
+      "type": "file"
+    },
+    {
+      "path": "src/config.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726289538,
+      "type": "file"
+    },
+    {
+      "path": "src/tracker/mod.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726309358,
+      "type": "file"
+    },
+    {
+      "path": "src/agent/mod.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784726320084,
+      "type": "file"
+    },
+    {
+      "path": "docs/research/linear-graphql.md",
+      "accessCount": 1,
+      "lastAccessed": 1784726381247,
+      "type": "file"
+    }
+  ],
   "userDirectives": []
 }
