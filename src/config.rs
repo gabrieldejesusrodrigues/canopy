@@ -188,15 +188,24 @@ impl Config {
     }
 
     pub fn merger(&self) -> AgentRef {
-        self.routing.merger.clone().unwrap_or_else(|| self.routing.planner.clone())
+        self.routing
+            .merger
+            .clone()
+            .unwrap_or_else(|| self.routing.planner.clone())
     }
 
     pub fn reconciler(&self) -> AgentRef {
-        self.routing.reconciler.clone().unwrap_or_else(|| self.routing.planner.clone())
+        self.routing
+            .reconciler
+            .clone()
+            .unwrap_or_else(|| self.routing.planner.clone())
     }
 
     pub fn decomposer(&self) -> AgentRef {
-        self.routing.decomposer.clone().unwrap_or_else(|| self.routing.executor.clone())
+        self.routing
+            .decomposer
+            .clone()
+            .unwrap_or_else(|| self.routing.executor.clone())
     }
 
     /// State dir inside the target repo (gitignored).

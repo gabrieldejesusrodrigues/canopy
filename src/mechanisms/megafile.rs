@@ -77,11 +77,9 @@ impl BlockList {
     /// The decomposer itself (node id matches) is exempt: it must touch the
     /// file to split it.
     pub fn gate<'a>(&self, files: &'a [String], node_id: &str) -> Option<&'a str> {
-        files.iter().find_map(|f| {
-            match self.state.blocked.get(f) {
-                Some(owner) if owner != node_id => Some(f.as_str()),
-                _ => None,
-            }
+        files.iter().find_map(|f| match self.state.blocked.get(f) {
+            Some(owner) if owner != node_id => Some(f.as_str()),
+            _ => None,
         })
     }
 

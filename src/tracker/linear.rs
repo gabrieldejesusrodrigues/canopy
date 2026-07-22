@@ -222,10 +222,11 @@ impl LinearTracker {
         let client = Client::new();
 
         // Fetch workflow states and build NodeState -> stateId mapping.
-        let resp = Self::gql_raw(&client, &api_key, Q_TEAM_STATES, json!({"teamId": team_id})).await?;
-        let states: Vec<WorkflowStateNode> = serde_json::from_value(
-            resp["team"]["states"]["nodes"].clone(),
-        ).context("parsing team states")?;
+        let resp =
+            Self::gql_raw(&client, &api_key, Q_TEAM_STATES, json!({"teamId": team_id})).await?;
+        let states: Vec<WorkflowStateNode> =
+            serde_json::from_value(resp["team"]["states"]["nodes"].clone())
+                .context("parsing team states")?;
 
         // Pick one state per Linear type category (lowest position / first encountered).
         let mut by_type: HashMap<String, String> = HashMap::new();
@@ -234,34 +235,52 @@ impl LinearTracker {
         }
 
         let pick = |t: &str| -> Result<String> {
-            by_type.get(t).cloned().with_context(|| format!("no Linear workflow state of type '{t}' found in team"))
+            by_type
+                .get(t)
+                .cloned()
+                .with_context(|| format!("no Linear workflow state of type '{t}' found in team"))
         };
 
         // Map canopy states to Linear workflow types.
         // decomposed -> started (planner still owns its subtree).
         let mut state_map = HashMap::new();
-        state_map.insert("ready".into(),       pick("unstarted")?);
-        state_map.insert("running".into(),     pick("started")?);
-        state_map.insert("decomposed".into(),  pick("started")?);
+        state_map.insert("ready".into(), pick("unstarted")?);
+        state_map.insert("running".into(), pick("started")?);
+        state_map.insert("decomposed".into(), pick("started")?);
         state_map.insert("needs_merge".into(), pick("started")?);
-        state_map.insert("merging".into(),     pick("started")?);
-        state_map.insert("in_review".into(),   pick("started")?);
-        state_map.insert("blocked".into(),     pick("backlog")?);
-        state_map.insert("done".into(),        pick("completed")?);
-        state_map.insert("failed".into(),      pick("canceled")?);
+        state_map.insert("merging".into(), pick("started")?);
+        state_map.insert("in_review".into(), pick("started")?);
+        state_map.insert("blocked".into(), pick("backlog")?);
+        state_map.insert("done".into(), pick("completed")?);
+        state_map.insert("failed".into(), pick("canceled")?);
 
-        Ok(Self { client, api_key, team_id, state_map })
+        Ok(Self {
+            client,
+            api_key,
+            team_id,
+            state_map,
+        })
     }
 
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    async fn gql_raw(client: &Client, api_key: &str, query: &str, variables: Value) -> Result<Value> {
+    async fn gql_raw(
+        client: &Client,
+        api_key: &str,
+        query: &str,
+        variables: Value,
+    ) -> Result<Value> {
         Self::gql_raw_with_retry(client, api_key, query, variables).await
     }
 
-    async fn gql_raw_with_retry(client: &Client, api_key: &str, query: &str, variables: Value) -> Result<Value> {
+    async fn gql_raw_with_retry(
+        client: &Client,
+        api_key: &str,
+        query: &str,
+        variables: Value,
+    ) -> Result<Value> {
         let body = json!({ "query": query, "variables": variables });
 
         let resp = client
@@ -306,7 +325,10 @@ impl LinearTracker {
     }
 
     fn linear_state_id(&self, state: NodeState) -> &str {
-        self.state_map.get(state.as_str()).map(|s| s.as_str()).unwrap_or("")
+        self.state_map
+            .get(state.as_str())
+            .map(|s| s.as_str())
+            .unwrap_or("")
     }
 
     /// Fetch an issue's description, mutate the metadata, and write it back.
@@ -316,21 +338,25 @@ impl LinearTracker {
         F: FnOnce(&mut Meta) + Send,
     {
         let data = self.gql(Q_ISSUE, json!({ "id": id })).await?;
-        let issue: IssueNode = serde_json::from_value(data["issue"].clone())
-            .context("parsing issue")?;
+        let issue: IssueNode =
+            serde_json::from_value(data["issue"].clone()).context("parsing issue")?;
         let desc = issue.description.as_deref().unwrap_or("");
         let (body, existing_meta) = split_description(desc);
         let mut meta = existing_meta.context("issue has no canopy metadata")?;
         f(&mut meta);
         let new_state_id = self.linear_state_id(meta.state);
         let new_desc = encode_description(body, &meta);
-        self.gql(M_ISSUE_UPDATE, json!({
-            "id": id,
-            "input": {
-                "description": new_desc,
-                "stateId": new_state_id,
-            }
-        })).await?;
+        self.gql(
+            M_ISSUE_UPDATE,
+            json!({
+                "id": id,
+                "input": {
+                    "description": new_desc,
+                    "stateId": new_state_id,
+                }
+            }),
+        )
+        .await?;
         Ok(meta)
     }
 
@@ -370,19 +396,32 @@ impl Tracker for LinearTracker {
     async fn init_run(&self, objective: &str, branch: &str) -> Result<Run> {
         // Truncate project name to 60 chars + timestamp for uniqueness.
         let ts = Utc::now().format("%Y%m%d-%H%M%S");
-        let short = if objective.len() > 60 { &objective[..60] } else { objective };
+        let short = if objective.len() > 60 {
+            &objective[..60]
+        } else {
+            objective
+        };
         let project_name = format!("{short} [{ts}]");
 
-        let data = self.gql(M_PROJECT_CREATE, json!({
-            "input": {
-                "name": project_name,
-                "teamIds": [self.team_id],
-            }
-        })).await?;
+        let data = self
+            .gql(
+                M_PROJECT_CREATE,
+                json!({
+                    "input": {
+                        "name": project_name,
+                        "teamIds": [self.team_id],
+                    }
+                }),
+            )
+            .await?;
 
-        let project = data["projectCreate"]["project"].as_object()
+        let project = data["projectCreate"]["project"]
+            .as_object()
             .context("projectCreate returned null project")?;
-        let run_id = project["id"].as_str().context("project id missing")?.to_string();
+        let run_id = project["id"]
+            .as_str()
+            .context("project id missing")?
+            .to_string();
 
         // Create root Plan issue.
         let root_node_id = uuid::Uuid::new_v4().to_string();
@@ -399,20 +438,29 @@ impl Tracker for LinearTracker {
         let state_id = self.linear_state_id(NodeState::Ready);
         let description = encode_description(objective, &meta);
 
-        let data = self.gql(M_ISSUE_CREATE, json!({
-            "input": {
-                "id": root_node_id,
-                "teamId": self.team_id,
-                "projectId": run_id,
-                "title": "Objective",
-                "description": description,
-                "stateId": state_id,
-            }
-        })).await?;
+        let data = self
+            .gql(
+                M_ISSUE_CREATE,
+                json!({
+                    "input": {
+                        "id": root_node_id,
+                        "teamId": self.team_id,
+                        "projectId": run_id,
+                        "title": "Objective",
+                        "description": description,
+                        "stateId": state_id,
+                    }
+                }),
+            )
+            .await?;
 
-        let issue = data["issueCreate"]["issue"].as_object()
+        let issue = data["issueCreate"]["issue"]
+            .as_object()
             .context("issueCreate returned null issue")?;
-        let actual_root_id = issue["id"].as_str().context("issue id missing")?.to_string();
+        let actual_root_id = issue["id"]
+            .as_str()
+            .context("issue id missing")?
+            .to_string();
 
         // Store branch + root_node on the project so load_run can reconstruct Run faithfully.
         let run_meta = RunMeta {
@@ -420,10 +468,14 @@ impl Tracker for LinearTracker {
             root_node: actual_root_id.clone(),
             objective: objective.to_string(),
         };
-        self.gql(M_PROJECT_UPDATE, json!({
-            "id": run_id,
-            "input": { "content": encode_run_content(&run_meta) }
-        })).await?;
+        self.gql(
+            M_PROJECT_UPDATE,
+            json!({
+                "id": run_id,
+                "input": { "content": encode_run_content(&run_meta) }
+            }),
+        )
+        .await?;
 
         let now = Utc::now();
         Ok(Run {
@@ -451,7 +503,11 @@ impl Tracker for LinearTracker {
 
     async fn create_node(&self, new: NewNode) -> Result<Node> {
         let node_id = uuid::Uuid::new_v4().to_string();
-        let state = if new.ready { NodeState::Ready } else { NodeState::Blocked };
+        let state = if new.ready {
+            NodeState::Ready
+        } else {
+            NodeState::Blocked
+        };
         let meta = Meta {
             run_id: new.run_id.clone(),
             kind: new.kind,
@@ -478,9 +534,13 @@ impl Tracker for LinearTracker {
         }
 
         let data = self.gql(M_ISSUE_CREATE, json!({ "input": input })).await?;
-        let issue = data["issueCreate"]["issue"].as_object()
+        let issue = data["issueCreate"]["issue"]
+            .as_object()
             .context("issueCreate returned null issue")?;
-        let actual_id = issue["id"].as_str().context("issue id missing")?.to_string();
+        let actual_id = issue["id"]
+            .as_str()
+            .context("issue id missing")?
+            .to_string();
 
         Ok(Node {
             id: actual_id,
@@ -501,8 +561,8 @@ impl Tracker for LinearTracker {
 
     async fn node(&self, id: &str) -> Result<Node> {
         let data = self.gql(Q_ISSUE, json!({ "id": id })).await?;
-        let issue: IssueNode = serde_json::from_value(data["issue"].clone())
-            .context("parsing issue")?;
+        let issue: IssueNode =
+            serde_json::from_value(data["issue"].clone()).context("parsing issue")?;
         let run_id = {
             let desc = issue.description.as_deref().unwrap_or("");
             let (_, meta) = split_description(desc);
@@ -514,8 +574,13 @@ impl Tracker for LinearTracker {
     async fn children(&self, parent_id: &str) -> Result<Vec<Node>> {
         // Fetch the parent to get run_id, then query all project issues with this parentId.
         let parent_node = self.node(parent_id).await?;
-        let all = self.nodes_in_state_paginated(&parent_node.run_id, None).await?;
-        Ok(all.into_iter().filter(|n| n.parent_id.as_deref() == Some(parent_id)).collect())
+        let all = self
+            .nodes_in_state_paginated(&parent_node.run_id, None)
+            .await?;
+        Ok(all
+            .into_iter()
+            .filter(|n| n.parent_id.as_deref() == Some(parent_id))
+            .collect())
     }
 
     async fn nodes_in_state(&self, run_id: &str, state: NodeState) -> Result<Vec<Node>> {
@@ -528,8 +593,8 @@ impl Tracker for LinearTracker {
     /// ponytail: no distributed lock — single-daemon guarantee documented in design
     async fn try_claim(&self, id: &str) -> Result<Option<Node>> {
         let data = self.gql(Q_ISSUE, json!({ "id": id })).await?;
-        let issue: IssueNode = serde_json::from_value(data["issue"].clone())
-            .context("parsing issue")?;
+        let issue: IssueNode =
+            serde_json::from_value(data["issue"].clone()).context("parsing issue")?;
         let desc = issue.description.as_deref().unwrap_or("");
         let (body, existing_meta) = split_description(desc);
         let meta = match existing_meta {
@@ -545,10 +610,15 @@ impl Tracker for LinearTracker {
         new_meta.claimed_at = Some(Utc::now());
         let state_id = self.linear_state_id(NodeState::Running);
         let new_desc = encode_description(body, &new_meta);
-        let resp = self.gql(M_ISSUE_UPDATE, json!({
-            "id": id,
-            "input": { "description": new_desc, "stateId": state_id }
-        })).await?;
+        let resp = self
+            .gql(
+                M_ISSUE_UPDATE,
+                json!({
+                    "id": id,
+                    "input": { "description": new_desc, "stateId": state_id }
+                }),
+            )
+            .await?;
         let updated_issue: IssueNode = serde_json::from_value(resp["issueUpdate"]["issue"].clone())
             .context("parsing updated issue")?;
         let run_id = new_meta.run_id.clone();
@@ -557,8 +627,8 @@ impl Tracker for LinearTracker {
 
     async fn transition(&self, id: &str, from: NodeState, to: NodeState) -> Result<bool> {
         let data = self.gql(Q_ISSUE, json!({ "id": id })).await?;
-        let issue: IssueNode = serde_json::from_value(data["issue"].clone())
-            .context("parsing issue")?;
+        let issue: IssueNode =
+            serde_json::from_value(data["issue"].clone()).context("parsing issue")?;
         let desc = issue.description.as_deref().unwrap_or("");
         let (body, existing_meta) = split_description(desc);
         let meta = match existing_meta {
@@ -572,10 +642,14 @@ impl Tracker for LinearTracker {
         new_meta.state = to;
         let state_id = self.linear_state_id(to);
         let new_desc = encode_description(body, &new_meta);
-        self.gql(M_ISSUE_UPDATE, json!({
-            "id": id,
-            "input": { "description": new_desc, "stateId": state_id }
-        })).await?;
+        self.gql(
+            M_ISSUE_UPDATE,
+            json!({
+                "id": id,
+                "input": { "description": new_desc, "stateId": state_id }
+            }),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -592,16 +666,20 @@ impl Tracker for LinearTracker {
     async fn update_spec(&self, id: &str, spec: &str) -> Result<()> {
         // Rewrite description body while keeping metadata footer.
         let data = self.gql(Q_ISSUE, json!({ "id": id })).await?;
-        let issue: IssueNode = serde_json::from_value(data["issue"].clone())
-            .context("parsing issue")?;
+        let issue: IssueNode =
+            serde_json::from_value(data["issue"].clone()).context("parsing issue")?;
         let desc = issue.description.as_deref().unwrap_or("");
         let (_, existing_meta) = split_description(desc);
         let meta = existing_meta.context("issue has no canopy metadata")?;
         let new_desc = encode_description(spec, &meta);
-        self.gql(M_ISSUE_UPDATE, json!({
-            "id": id,
-            "input": { "description": new_desc }
-        })).await?;
+        self.gql(
+            M_ISSUE_UPDATE,
+            json!({
+                "id": id,
+                "input": { "description": new_desc }
+            }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -612,7 +690,8 @@ impl Tracker for LinearTracker {
     }
 
     async fn comment(&self, id: &str, body: &str) -> Result<()> {
-        self.gql(M_COMMENT_CREATE, json!({ "issueId": id, "body": body })).await?;
+        self.gql(M_COMMENT_CREATE, json!({ "issueId": id, "body": body }))
+            .await?;
         Ok(())
     }
 
@@ -628,7 +707,8 @@ impl Tracker for LinearTracker {
                     self.mutate_meta(&id, |m| {
                         m.state = NodeState::Ready;
                         m.claimed_at = None;
-                    }).await?;
+                    })
+                    .await?;
                     count += 1;
                 }
             }
@@ -639,17 +719,22 @@ impl Tracker for LinearTracker {
     async fn unblock_satisfied(&self, run_id: &str) -> Result<u32> {
         let blocked = self.nodes_in_state(run_id, NodeState::Blocked).await?;
         let all = self.nodes_in_state_paginated(run_id, None).await?;
-        let done_ids: std::collections::HashSet<&str> = all.iter()
+        let done_ids: std::collections::HashSet<&str> = all
+            .iter()
             .filter(|n| n.state == NodeState::Done)
             .map(|n| n.id.as_str())
             .collect();
 
         let mut count = 0u32;
         for node in blocked {
-            let all_done = node.depends_on.iter().all(|dep| done_ids.contains(dep.as_str()));
+            let all_done = node
+                .depends_on
+                .iter()
+                .all(|dep| done_ids.contains(dep.as_str()));
             if all_done {
                 let id = node.id.clone();
-                self.mutate_meta(&id, |m| m.state = NodeState::Ready).await?;
+                self.mutate_meta(&id, |m| m.state = NodeState::Ready)
+                    .await?;
                 count += 1;
             }
         }
@@ -665,7 +750,11 @@ impl LinearTracker {
     /// Fetch all issues in a project, optionally filtered by Linear state type.
     /// Metadata is authoritative; Linear state type is only used to narrow the
     /// server-side result set (optional optimisation — pass None to fetch all).
-    async fn nodes_in_state_paginated(&self, run_id: &str, _state_type: Option<&str>) -> Result<Vec<Node>> {
+    async fn nodes_in_state_paginated(
+        &self,
+        run_id: &str,
+        _state_type: Option<&str>,
+    ) -> Result<Vec<Node>> {
         let mut nodes = Vec::new();
         let mut cursor: Option<String> = None;
 
@@ -699,7 +788,9 @@ impl LinearTracker {
             if !has_next {
                 break;
             }
-            cursor = page["pageInfo"]["endCursor"].as_str().map(|s| s.to_string());
+            cursor = page["pageInfo"]["endCursor"]
+                .as_str()
+                .map(|s| s.to_string());
         }
 
         Ok(nodes)
@@ -720,7 +811,10 @@ mod tests {
             run_id: "run-abc".into(),
             kind: NodeKind::Execute,
             state: NodeState::Ready,
-            agent: Some(AgentRef { cli: CliKind::Claude, model: "opus".into() }),
+            agent: Some(AgentRef {
+                cli: CliKind::Claude,
+                model: "opus".into(),
+            }),
             depends_on: vec!["dep-1".into(), "dep-2".into()],
             depth: 3,
             attempt: 2,
@@ -770,16 +864,26 @@ mod tests {
     #[test]
     fn meta_state_all_variants() {
         let states = [
-            NodeState::Ready, NodeState::Running, NodeState::Decomposed,
-            NodeState::NeedsMerge, NodeState::Merging, NodeState::InReview,
-            NodeState::Blocked, NodeState::Done, NodeState::Failed,
+            NodeState::Ready,
+            NodeState::Running,
+            NodeState::Decomposed,
+            NodeState::NeedsMerge,
+            NodeState::Merging,
+            NodeState::InReview,
+            NodeState::Blocked,
+            NodeState::Done,
+            NodeState::Failed,
         ];
         for state in states {
             let mut meta = sample_meta();
             meta.state = state;
             let desc = encode_description("spec", &meta);
             let (_, parsed) = split_description(&desc);
-            assert_eq!(parsed.unwrap().state, state, "roundtrip failed for {state:?}");
+            assert_eq!(
+                parsed.unwrap().state,
+                state,
+                "roundtrip failed for {state:?}"
+            );
         }
     }
 
@@ -803,7 +907,10 @@ mod tests {
             objective: "do stuff".into(),
         };
         // Linear project content field may have other text around the marker.
-        let content = format!("# Project notes\nSome prose.\n\n{}", encode_run_content(&run_meta));
+        let content = format!(
+            "# Project notes\nSome prose.\n\n{}",
+            encode_run_content(&run_meta)
+        );
         let parsed = parse_run_content(&content).expect("should parse embedded footer");
         assert_eq!(parsed, run_meta);
     }

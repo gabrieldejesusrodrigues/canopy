@@ -73,50 +73,80 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
     let claimed_at_str: Option<String> = row.get(11)?;
     let updated_at_str: String = row.get(12)?;
 
-    let kind = str_to_kind(&kind_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-        3,
-        rusqlite::types::Type::Text,
-        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
-    ))?;
-    let state = NodeState::parse(&state_str).ok_or_else(|| rusqlite::Error::FromSqlConversionFailure(
-        4,
-        rusqlite::types::Type::Text,
-        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("unknown state '{state_str}'"))),
-    ))?;
+    let kind = str_to_kind(&kind_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            )),
+        )
+    })?;
+    let state = NodeState::parse(&state_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown state '{state_str}'"),
+            )),
+        )
+    })?;
 
     let agent: Option<AgentRef> = agent_json
         .as_deref()
         .map(|j| serde_json::from_str(j))
         .transpose()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-            7,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
-        ))?;
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?;
 
-    let depends_on: Vec<String> = serde_json::from_str(&depends_on_json).map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-        8,
-        rusqlite::types::Type::Text,
-        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
-    ))?;
+    let depends_on: Vec<String> = serde_json::from_str(&depends_on_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            )),
+        )
+    })?;
 
     let claimed_at = claimed_at_str
         .as_deref()
         .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)))
         .transpose()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-            11,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
-        ))?;
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?;
 
     let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)
         .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-            12,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
-        ))?;
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                12,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?;
 
     Ok(Node {
         id: row.get(0)?,
@@ -155,7 +185,9 @@ impl SqliteTracker {
         // WAL mode improves concurrent reads.
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .context("setting pragma")?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 
@@ -200,11 +232,16 @@ impl Tracker for SqliteTracker {
                 let created_at_str: String = row.get(4)?;
                 let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
                     .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
-                    ))?;
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                e.to_string(),
+                            )),
+                        )
+                    })?;
                 Ok(Run {
                     id: row.get(0)?,
                     objective: row.get(1)?,
@@ -213,17 +250,25 @@ impl Tracker for SqliteTracker {
                     created_at,
                 })
             },
-        ).with_context(|| format!("loading run {run_id}"))
+        )
+        .with_context(|| format!("loading run {run_id}"))
     }
 
     async fn create_node(&self, new: NewNode) -> Result<Node> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
         let now_s = now.to_rfc3339();
-        let state = if new.ready { NodeState::Ready } else { NodeState::Blocked };
+        let state = if new.ready {
+            NodeState::Ready
+        } else {
+            NodeState::Blocked
+        };
         let state_str = state.as_str();
         let kind_str = kind_to_str(new.kind);
-        let agent_json = new.agent.as_ref().map(|a| serde_json::to_string(a).unwrap());
+        let agent_json = new
+            .agent
+            .as_ref()
+            .map(|a| serde_json::to_string(a).unwrap());
         let depends_on_json = serde_json::to_string(&new.depends_on).unwrap();
 
         let conn = self.conn.lock().unwrap();
@@ -391,7 +436,8 @@ impl Tracker for SqliteTracker {
             let mut stmt = conn.prepare(
                 "SELECT id, depends_on_json FROM nodes WHERE run_id = ?1 AND state = 'blocked'",
             )?;
-            let rows = stmt.query_map(params![run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            let rows = stmt
+                .query_map(params![run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
@@ -404,8 +450,7 @@ impl Tracker for SqliteTracker {
         let mut unblocked = 0u32;
 
         for (node_id, deps_json) in blocked {
-            let deps: Vec<String> = serde_json::from_str(&deps_json)
-                .unwrap_or_default();
+            let deps: Vec<String> = serde_json::from_str(&deps_json).unwrap_or_default();
 
             if deps.is_empty() {
                 // No dependencies — just unblock it.
@@ -486,38 +531,50 @@ mod tests {
         assert!(second.is_none());
 
         // transition CAS: wrong `from` returns false
-        let ok = t.transition(&root.id, NodeState::Ready, NodeState::Done).await.unwrap();
+        let ok = t
+            .transition(&root.id, NodeState::Ready, NodeState::Done)
+            .await
+            .unwrap();
         assert!(!ok, "should fail: node is running, not ready");
 
         // correct CAS succeeds
-        let ok = t.transition(&root.id, NodeState::Running, NodeState::Decomposed).await.unwrap();
+        let ok = t
+            .transition(&root.id, NodeState::Running, NodeState::Decomposed)
+            .await
+            .unwrap();
         assert!(ok);
 
         // create two children: child_b depends on child_a
-        let child_a = t.create_node(NewNode {
-            run_id: run.id.clone(),
-            parent_id: Some(root.id.clone()),
-            kind: NodeKind::Execute,
-            title: "step A".into(),
-            spec: "do A".into(),
-            agent: None,
-            depends_on: vec![],
-            depth: 1,
-            ready: true,
-        }).await.unwrap();
+        let child_a = t
+            .create_node(NewNode {
+                run_id: run.id.clone(),
+                parent_id: Some(root.id.clone()),
+                kind: NodeKind::Execute,
+                title: "step A".into(),
+                spec: "do A".into(),
+                agent: None,
+                depends_on: vec![],
+                depth: 1,
+                ready: true,
+            })
+            .await
+            .unwrap();
         assert_eq!(child_a.state, NodeState::Ready);
 
-        let child_b = t.create_node(NewNode {
-            run_id: run.id.clone(),
-            parent_id: Some(root.id.clone()),
-            kind: NodeKind::Execute,
-            title: "step B".into(),
-            spec: "do B".into(),
-            agent: None,
-            depends_on: vec![child_a.id.clone()],
-            depth: 1,
-            ready: false,
-        }).await.unwrap();
+        let child_b = t
+            .create_node(NewNode {
+                run_id: run.id.clone(),
+                parent_id: Some(root.id.clone()),
+                kind: NodeKind::Execute,
+                title: "step B".into(),
+                spec: "do B".into(),
+                agent: None,
+                depends_on: vec![child_a.id.clone()],
+                depth: 1,
+                ready: false,
+            })
+            .await
+            .unwrap();
         assert_eq!(child_b.state, NodeState::Blocked);
 
         // unblock_satisfied: child_b's dep (A) is not done yet -> 0

@@ -1,5 +1,7 @@
 mod agent;
 mod config;
+#[cfg(test)]
+mod e2e;
 mod gitops;
 mod ledger;
 mod mechanisms;
@@ -16,7 +18,11 @@ use clap::{Parser, Subcommand};
 use crate::model::NodeState;
 
 #[derive(Parser)]
-#[command(name = "canopy", about = "Agent swarm harness — trees/trunks/leaves over claude/codex/agy", version)]
+#[command(
+    name = "canopy",
+    about = "Agent swarm harness — trees/trunks/leaves over claude/codex/agy",
+    version
+)]
 struct Cli {
     /// Path to canopy.toml
     #[arg(short, long, default_value = "canopy.toml", global = true)]
@@ -160,16 +166,15 @@ async fn status(cfg: &config::Config, run: Option<String>) -> Result<()> {
     let run_id = resolve_run(cfg, run)?;
     let tracker = tracker::from_config(cfg).await?;
     let run = tracker.load_run(&run_id).await?;
-    println!("run {} — branch {}\nobjective: {}\n", run.id, run.branch, run.objective);
+    println!(
+        "run {} — branch {}\nobjective: {}\n",
+        run.id, run.branch, run.objective
+    );
     print_subtree(tracker.as_ref(), &run.root_node, 0).await?;
     Ok(())
 }
 
-async fn print_subtree(
-    tracker: &dyn tracker::Tracker,
-    node_id: &str,
-    depth: usize,
-) -> Result<()> {
+async fn print_subtree(tracker: &dyn tracker::Tracker, node_id: &str, depth: usize) -> Result<()> {
     let node = tracker.node(node_id).await?;
     let marker = match node.state {
         NodeState::Done => "✓",

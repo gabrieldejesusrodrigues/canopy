@@ -10,7 +10,7 @@
   },
   "build": {
     "buildCommand": null,
-    "testCommand": "export PATH=\"$HOME/.cargo/bin:$PATH\" && cargo test 2>&1 | tail -15",
+    "testCommand": "export PATH=\"$HOME/.cargo/bin:$PATH\" && cargo test 2>&1 | tail -12",
     "lintCommand": null,
     "devCommand": null,
     "scripts": {}
@@ -45,14 +45,20 @@
   "hotPaths": [
     {
       "path": "src/agent/stub.rs",
-      "accessCount": 14,
-      "lastAccessed": 1784726989558,
+      "accessCount": 18,
+      "lastAccessed": 1784727358215,
+      "type": "file"
+    },
+    {
+      "path": "src/scheduler.rs",
+      "accessCount": 12,
+      "lastAccessed": 1784727477603,
       "type": "file"
     },
     {
       "path": "src/main.rs",
-      "accessCount": 11,
-      "lastAccessed": 1784727191981,
+      "accessCount": 12,
+      "lastAccessed": 1784727525307,
       "type": "file"
     },
     {
@@ -62,9 +68,9 @@
       "type": "file"
     },
     {
-      "path": "src/scheduler.rs",
-      "accessCount": 6,
-      "lastAccessed": 1784727234864,
+      "path": "src/gitops.rs",
+      "accessCount": 5,
+      "lastAccessed": 1784727453179,
       "type": "file"
     },
     {
@@ -83,12 +89,6 @@
       "path": "docs/DESIGN.md",
       "accessCount": 3,
       "lastAccessed": 1784726570537,
-      "type": "file"
-    },
-    {
-      "path": "src/gitops.rs",
-      "accessCount": 3,
-      "lastAccessed": 1784726929652,
       "type": "file"
     },
     {
@@ -233,6 +233,12 @@
       "path": "src/prompt.rs",
       "accessCount": 1,
       "lastAccessed": 1784726839908,
+      "type": "file"
+    },
+    {
+      "path": "src/e2e.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784727512702,
       "type": "file"
     }
   ],

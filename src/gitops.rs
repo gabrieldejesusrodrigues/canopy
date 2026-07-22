@@ -142,11 +142,7 @@ impl GitOps {
     pub async fn changed_files(&self, node_id: &str, run_branch: &str) -> Result<Vec<String>> {
         let branch = Self::node_branch(node_id);
         let out = self
-            .git(&[
-                "diff",
-                "--name-only",
-                &format!("{run_branch}...{branch}"),
-            ])
+            .git(&["diff", "--name-only", &format!("{run_branch}...{branch}")])
             .await?;
         Ok(out.lines().map(str::to_owned).collect())
     }
@@ -195,7 +191,9 @@ impl GitOps {
         let mut out = String::new();
         for f in files.lines() {
             out.push_str(&format!("--- {f} ---\n"));
-            let content = tokio::fs::read_to_string(md.join(f)).await.unwrap_or_default();
+            let content = tokio::fs::read_to_string(md.join(f))
+                .await
+                .unwrap_or_default();
             // Only the conflicted regions plus a little air, not whole files.
             let mut keep = false;
             for (i, line) in content.lines().enumerate() {
@@ -215,14 +213,26 @@ impl GitOps {
         Ok(out)
     }
 
-    /// After the Merger ran: true if no unmerged paths remain (finalize_merge
-    /// then commits if the Merger staged without committing).
+    /// After the Merger ran: stage its resolution (git add clears unmerged
+    /// index entries) and verify nothing conflicted remains — neither unmerged
+    /// paths nor staged leftover conflict markers.
     pub async fn merge_resolved(&self) -> Result<bool> {
         let md = self.merge_dir();
+        self.git_in(&md, &["add", "-A"]).await?;
         let unmerged = self
             .git_in(&md, &["diff", "--diff-filter=U", "--name-only"])
             .await?;
-        Ok(unmerged.trim().is_empty())
+        if !unmerged.trim().is_empty() {
+            return Ok(false);
+        }
+        let markers = Command::new("git")
+            .args(["grep", "--cached", "-l", "^<<<<<<< "])
+            .current_dir(&md)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await?;
+        // git grep exits 1 with empty stdout when nothing matches.
+        Ok(String::from_utf8_lossy(&markers.stdout).trim().is_empty())
     }
 
     async fn merge_head_exists(&self, md: &Path) -> bool {
@@ -236,8 +246,15 @@ impl GitOps {
         let md = self.merge_dir();
         if self.merge_head_exists(&md).await {
             self.git_in(&md, &["add", "-A"]).await?;
-            self.git_in(&md, &["commit", "--no-edit", "-m", &format!("canopy: merge node {node_id} (resolved)")])
-                .await?;
+            self.git_in(
+                &md,
+                &[
+                    "commit",
+                    "-m",
+                    &format!("canopy: merge node {node_id} (resolved)"),
+                ],
+            )
+            .await?;
         }
         let sha = self.git_in(&md, &["rev-parse", "HEAD"]).await?;
         Ok(sha.trim().to_owned())
@@ -271,7 +288,14 @@ impl GitOps {
     pub async fn merge_diff(&self, merge_commit: &str) -> Result<String> {
         self.git_in(
             &self.merge_dir(),
-            &["show", "--format=", "--patch", "-m", "--first-parent", merge_commit],
+            &[
+                "show",
+                "--format=",
+                "--patch",
+                "-m",
+                "--first-parent",
+                merge_commit,
+            ],
         )
         .await
     }

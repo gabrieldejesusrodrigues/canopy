@@ -52,7 +52,14 @@ fn docs_section(docs: &[DesignDoc]) -> String {
 fn allowlist_section(allowlist: &[AllowlistEntry]) -> String {
     allowlist
         .iter()
-        .map(|e| format!("- cli: {} model: {} — {}", serde_json::to_string(&e.cli).unwrap().trim_matches('"'), e.model, e.good_for))
+        .map(|e| {
+            format!(
+                "- cli: {} model: {} — {}",
+                serde_json::to_string(&e.cli).unwrap().trim_matches('"'),
+                e.model,
+                e.good_for
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -79,7 +86,12 @@ pub fn planner(
     )
 }
 
-pub fn executor(fieldguide: &str, spec: &str, docs: &[DesignDoc], retry_context: Option<&str>) -> String {
+pub fn executor(
+    fieldguide: &str,
+    spec: &str,
+    docs: &[DesignDoc],
+    retry_context: Option<&str>,
+) -> String {
     assemble(
         fieldguide,
         EXECUTOR,
@@ -131,7 +143,10 @@ pub fn reviewer(
         Lens::Transcript => vec![
             ("WORK UNIT", spec),
             ("DIFF", diff),
-            ("TRANSCRIPT", transcript.unwrap_or("(transcript unavailable)")),
+            (
+                "TRANSCRIPT",
+                transcript.unwrap_or("(transcript unavailable)"),
+            ),
         ],
     };
     assemble(fieldguide, contract, &sections)

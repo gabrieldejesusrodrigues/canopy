@@ -45,6 +45,20 @@ pub struct Scheduler {
     /// planner node → replans consumed.
     replans: HashMap<String, u32>,
     paused_for_budget: bool,
+    /// Applications that write to the merge worktree (design docs), deferred
+    /// while a merge job is in flight — the merge lane owns that checkout.
+    pending: Vec<Deferred>,
+}
+
+enum Deferred {
+    Plan(Node, PlannerOutput),
+    Reconcile {
+        author_node: String,
+        agent_ref: AgentRef,
+        res: Result<InvocationResult>,
+        incumbent_id: String,
+        incoming_id: String,
+    },
 }
 
 struct ReviewAgg {
@@ -82,11 +96,15 @@ enum JobOut {
 
 enum MergeReport {
     /// Touches a blocked megafile → node waits for the decomposer.
-    Gated { file: String },
+    Gated {
+        file: String,
+    },
     /// No commits — nothing to merge or review.
     Empty,
     /// Reverted with a reason (field guide budget, design refs, verify).
-    Bounced { reason: String },
+    Bounced {
+        reason: String,
+    },
     /// Conflict the Merger couldn't fix → retry node on the new base.
     ConflictFailed,
     Landed {
@@ -110,8 +128,7 @@ impl Scheduler {
         let run = match (objective, resume) {
             (_, Some(id)) => tracker.load_run(&id).await?,
             (Some(obj), None) => {
-                let branch =
-                    format!("canopy/run-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+                let branch = format!("canopy/run-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
                 tracker.init_run(&obj, &branch).await?
             }
             (None, None) => anyhow::bail!("provide an objective or --resume <run-id>"),
@@ -119,12 +136,16 @@ impl Scheduler {
 
         git.ensure_run_branch(&run.branch).await?;
         if fieldguide::ensure_scaffold(&git.merge_dir())? {
-            git.harness_commit("canopy: scaffold design/ and fieldguide/").await?;
+            git.harness_commit("canopy: scaffold design/ and fieldguide/")
+                .await?;
         }
         let blocklist = BlockList::load(&cfg.state_dir())?;
 
         tracing::info!(run = run.id, branch = run.branch, "canopy run starting");
-        println!("run: {}\nbranch: {}\nboard: {}", run.id, run.branch, cfg.run.tracker);
+        println!(
+            "run: {}\nbranch: {}\nboard: {}",
+            run.id, run.branch, cfg.run.tracker
+        );
         // Convenience handle for `canopy status` / `canopy report`.
         std::fs::write(cfg.state_dir().join("last-run"), &run.id).ok();
 
@@ -143,6 +164,7 @@ impl Scheduler {
             retry_ctx: HashMap::new(),
             replans: HashMap::new(),
             paused_for_budget: false,
+            pending: Vec::new(),
         };
         sched.recover_in_review().await?;
         sched.run_loop().await
@@ -151,15 +173,14 @@ impl Scheduler {
     async fn run_loop(&mut self) -> Result<()> {
         loop {
             self.settle().await?;
+            self.pump_deferred().await?;
             self.pump_merges().await?;
             self.pump_reviews().await?;
             self.claim_and_spawn().await?;
 
             // Terminal check: root Done/Failed and nothing in flight.
             let root = self.tracker.node(&self.run.root_node.clone()).await?;
-            if self.jobs.is_empty()
-                && matches!(root.state, NodeState::Done | NodeState::Failed)
-            {
+            if self.jobs.is_empty() && matches!(root.state, NodeState::Done | NodeState::Failed) {
                 let report = self.ledger.report(&self.run.id)?;
                 println!("{report}");
                 println!(
@@ -215,6 +236,29 @@ impl Scheduler {
         if spent >= self.cfg.budgets.max_usd && !self.paused_for_budget {
             tracing::warn!(spent, cap = self.cfg.budgets.max_usd, "budget cap hit");
             self.paused_for_budget = true;
+        }
+        Ok(())
+    }
+
+    /// Flush deferred merge-worktree writers once the merge lane is idle.
+    async fn pump_deferred(&mut self) -> Result<()> {
+        if self.merge_inflight || self.pending.is_empty() {
+            return Ok(());
+        }
+        for d in std::mem::take(&mut self.pending) {
+            match d {
+                Deferred::Plan(node, out) => self.apply_planner_output(node, out).await?,
+                Deferred::Reconcile {
+                    author_node,
+                    agent_ref,
+                    res,
+                    incumbent_id,
+                    incoming_id,
+                } => {
+                    self.apply_reconcile(author_node, agent_ref, res, incumbent_id, incoming_id)
+                        .await?
+                }
+            }
         }
         Ok(())
     }
@@ -397,7 +441,12 @@ impl Scheduler {
         self.tracker
             .comment(
                 &node.id,
-                &format!("claimed by {}:{} (attempt {})", agent_ref.cli.as_str(), agent_ref.model, node.attempt + 1),
+                &format!(
+                    "claimed by {}:{} (attempt {})",
+                    agent_ref.cli.as_str(),
+                    agent_ref.model,
+                    node.attempt + 1
+                ),
             )
             .await?;
         Ok(())
@@ -481,6 +530,16 @@ impl Scheduler {
                 incumbent_id,
                 incoming_id,
             } => {
+                if self.merge_inflight {
+                    self.pending.push(Deferred::Reconcile {
+                        author_node,
+                        agent_ref,
+                        res,
+                        incumbent_id,
+                        incoming_id,
+                    });
+                    return Ok(());
+                }
                 self.apply_reconcile(author_node, agent_ref, res, incumbent_id, incoming_id)
                     .await
             }
@@ -526,13 +585,25 @@ impl Scheduler {
             Ok(inv) => {
                 self.record(&node.id, node_role(&node), &agent_ref, &inv, node.attempt);
                 if !inv.exit_ok {
-                    let tail: String = inv.final_message.chars().rev().take(800).collect::<String>().chars().rev().collect();
-                    return self.fail_attempt(node, &format!("agent error: {tail}")).await;
+                    let tail: String = inv
+                        .final_message
+                        .chars()
+                        .rev()
+                        .take(800)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    return self
+                        .fail_attempt(node, &format!("agent error: {tail}"))
+                        .await;
                 }
                 inv
             }
             Err(e) => {
-                return self.fail_attempt(node, &format!("invocation failed: {e:#}")).await;
+                return self
+                    .fail_attempt(node, &format!("invocation failed: {e:#}"))
+                    .await;
             }
         };
 
@@ -541,12 +612,20 @@ impl Scheduler {
             NodeKind::Plan => {
                 let parsed = json.and_then(|j| serde_json::from_str::<PlannerOutput>(j).ok());
                 match parsed {
+                    Some(out) if self.merge_inflight => {
+                        // Design-doc writes must wait for the merge lane.
+                        self.pending.push(Deferred::Plan(node, out));
+                        Ok(())
+                    }
                     Some(out) => self.apply_planner_output(node, out).await,
                     None if !was_nudged => {
                         let nudged = prompt::json_retry_nudge(&prompt_used, "missing or invalid");
                         self.respawn_with_prompt(node, agent_ref, nudged).await
                     }
-                    None => self.fail_attempt(node, "structured output unparseable twice").await,
+                    None => {
+                        self.fail_attempt(node, "structured output unparseable twice")
+                            .await
+                    }
                 }
             }
             NodeKind::Execute => {
@@ -557,7 +636,10 @@ impl Scheduler {
                         let nudged = prompt::json_retry_nudge(&prompt_used, "missing or invalid");
                         self.respawn_with_prompt(node, agent_ref, nudged).await
                     }
-                    None => self.fail_attempt(node, "structured output unparseable twice").await,
+                    None => {
+                        self.fail_attempt(node, "structured output unparseable twice")
+                            .await
+                    }
                 }
             }
         }
@@ -625,9 +707,7 @@ impl Scheduler {
                 continue;
             }
             // Renumber on plain id collisions (two planners both said DD-3).
-            if existing.iter().any(|d| d.meta.id == dd.id)
-                || !dd.id.starts_with("DD-")
-            {
+            if existing.iter().any(|d| d.meta.id == dd.id) || !dd.id.starts_with("DD-") {
                 dd.id = format!("DD-{next}");
                 next += 1;
             }
@@ -646,7 +726,10 @@ impl Scheduler {
         let mut summary = String::new();
         for (i, child) in out.children.iter().enumerate() {
             let kind = if deep { NodeKind::Execute } else { child.kind };
-            let agent = child.agent.as_ref().and_then(|a| self.validate_allowlisted(a));
+            let agent = child
+                .agent
+                .as_ref()
+                .and_then(|a| self.validate_allowlisted(a));
             let depends_on: Vec<String> = child
                 .depends_on
                 .iter()
@@ -671,7 +754,10 @@ impl Scheduler {
             created.push(n.id);
         }
         self.tracker
-            .comment(&node.id, &format!("decomposed into {} children:\n{summary}", created.len()))
+            .comment(
+                &node.id,
+                &format!("decomposed into {} children:\n{summary}", created.len()),
+            )
             .await?;
         if created.is_empty() {
             // Planner judged there is nothing to do.
@@ -708,7 +794,10 @@ impl Scheduler {
             .await?;
         for b in &out.breaks {
             self.tracker
-                .comment(&node.id, &format!("declared break in {}: {}", b.file, b.reason))
+                .comment(
+                    &node.id,
+                    &format!("declared break in {}: {}", b.file, b.reason),
+                )
                 .await?;
         }
         // Flags are applied post-merge (Landed) so a node's own flag can't
@@ -828,7 +917,13 @@ impl Scheduler {
             claimed_at: None,
             updated_at: chrono::Utc::now(),
         };
-        let req = self.request(&fake_node, Role::Reconciler, &agent_ref, p, self.git.merge_dir());
+        let req = self.request(
+            &fake_node,
+            Role::Reconciler,
+            &agent_ref,
+            p,
+            self.git.merge_dir(),
+        );
         let author = author_node.to_owned();
         let inc_id = incoming.id.clone();
         self.jobs.spawn(async move {
@@ -926,7 +1021,10 @@ impl Scheduler {
         match report {
             MergeReport::Gated { file } => {
                 self.tracker
-                    .comment(&node.id, &format!("merge gated: {file} is a blocked megafile"))
+                    .comment(
+                        &node.id,
+                        &format!("merge gated: {file} is a blocked megafile"),
+                    )
                     .await?;
                 // Back to the queue; the gate lifts when the decomposer lands.
                 self.tracker
@@ -943,16 +1041,21 @@ impl Scheduler {
             }
             MergeReport::Bounced { reason } => {
                 self.git.remove_worktree(&node.id).await.ok();
-                self.fail_attempt(node, &format!("merge bounced: {reason}")).await?;
+                self.fail_attempt(node, &format!("merge bounced: {reason}"))
+                    .await?;
             }
             MergeReport::ConflictFailed => {
                 self.git.remove_worktree(&node.id).await.ok();
-                self.fail_attempt(node, "merge conflict unresolved by merger — retrying on new base")
-                    .await?;
+                self.fail_attempt(
+                    node,
+                    "merge conflict unresolved by merger — retrying on new base",
+                )
+                .await?;
             }
             MergeReport::Error(e) => {
                 self.git.remove_worktree(&node.id).await.ok();
-                self.fail_attempt(node, &format!("merge error: {e}")).await?;
+                self.fail_attempt(node, &format!("merge error: {e}"))
+                    .await?;
             }
             MergeReport::Landed { commit, megafiles } => {
                 self.tracker
@@ -967,7 +1070,10 @@ impl Scheduler {
                 let lifted = self.blocklist.lift_for_node(&node.id)?;
                 if !lifted.is_empty() {
                     self.tracker
-                        .comment(&node.id, &format!("megafile blocks lifted: {}", lifted.join(", ")))
+                        .comment(
+                            &node.id,
+                            &format!("megafile blocks lifted: {}", lifted.join(", ")),
+                        )
                         .await?;
                 }
                 self.tracker
@@ -992,7 +1098,10 @@ impl Scheduler {
                     .and_then(|j| serde_json::from_str::<ReviewOutput>(j).ok())
                     .map(|r| r.findings)
                     .unwrap_or_else(|| {
-                        tracing::warn!("reviewer ({}) output unparseable — treated as clean", lens.as_str());
+                        tracing::warn!(
+                            "reviewer ({}) output unparseable — treated as clean",
+                            lens.as_str()
+                        );
                         Vec::new()
                     })
             }
@@ -1086,7 +1195,14 @@ impl Scheduler {
             *replans += 1;
             let summary = children
                 .iter()
-                .map(|c| format!("- [{}] {} — {}", c.state.as_str(), c.title, c.spec.lines().next().unwrap_or("")))
+                .map(|c| {
+                    format!(
+                        "- [{}] {} — {}",
+                        c.state.as_str(),
+                        c.title,
+                        c.spec.lines().next().unwrap_or("")
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             self.retry_ctx.insert(
@@ -1103,7 +1219,11 @@ impl Scheduler {
             self.tracker.set_state(&parent_id, NodeState::Ready).await?;
             return Ok(());
         }
-        let new_state = if any_failed { NodeState::Failed } else { NodeState::Done };
+        let new_state = if any_failed {
+            NodeState::Failed
+        } else {
+            NodeState::Done
+        };
         self.tracker.set_state(&parent_id, new_state).await?;
         self.tracker
             .comment(

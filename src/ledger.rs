@@ -125,7 +125,11 @@ impl Ledger {
                     pct(toks as f64, total_tokens as f64),
                     cost,
                     pct(cost, total),
-                    if unpriced > 0 { unpriced.to_string() } else { "-".into() },
+                    if unpriced > 0 {
+                        unpriced.to_string()
+                    } else {
+                        "-".into()
+                    },
                 ));
             }
         }
@@ -184,7 +188,8 @@ mod tests {
             exit_ok: true,
         };
         l.record("r1", &rec(Role::Planner, Some(1.0), 500)).unwrap();
-        l.record("r1", &rec(Role::Executor, Some(0.1), 9000)).unwrap();
+        l.record("r1", &rec(Role::Executor, Some(0.1), 9000))
+            .unwrap();
         l.record("r1", &rec(Role::Executor, None, 9000)).unwrap();
         assert!((l.total_cost("r1").unwrap() - 1.1).abs() < 1e-9);
         let report = l.report("r1").unwrap();

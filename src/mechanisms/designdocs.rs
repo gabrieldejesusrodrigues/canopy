@@ -96,7 +96,12 @@ fn render(meta: &DocMeta, body: &str) -> String {
 pub fn next_number(existing: &[DesignDoc]) -> u32 {
     existing
         .iter()
-        .filter_map(|d| d.meta.id.strip_prefix("DD-").and_then(|n| n.parse::<u32>().ok()))
+        .filter_map(|d| {
+            d.meta
+                .id
+                .strip_prefix("DD-")
+                .and_then(|n| n.parse::<u32>().ok())
+        })
         .max()
         .map(|n| n + 1)
         .unwrap_or(1)
@@ -113,10 +118,7 @@ pub fn find_conflict<'a>(
         d.meta.status == "active"
             && d.meta.author_node != author_node
             && (d.meta.id == decision.id
-                || d.meta
-                    .topics
-                    .iter()
-                    .any(|t| decision.topics.contains(t)))
+                || d.meta.topics.iter().any(|t| decision.topics.contains(t)))
     })
 }
 
@@ -194,18 +196,16 @@ fn find_all_refs(content: &str) -> Vec<String> {
 /// The "compile-checked reference": refs must target an existing, active doc.
 pub fn check_refs(refs: &[DesignRef], docs: &[DesignDoc]) -> Vec<String> {
     refs.iter()
-        .filter_map(|r| {
-            match docs.iter().find(|d| d.meta.id == r.doc_id) {
-                None => Some(format!(
-                    "{}: references {} which does not exist",
-                    r.file, r.doc_id
-                )),
-                Some(d) if d.meta.status != "active" => Some(format!(
-                    "{}: references {} which is superseded",
-                    r.file, r.doc_id
-                )),
-                Some(_) => None,
-            }
+        .filter_map(|r| match docs.iter().find(|d| d.meta.id == r.doc_id) {
+            None => Some(format!(
+                "{}: references {} which does not exist",
+                r.file, r.doc_id
+            )),
+            Some(d) if d.meta.status != "active" => Some(format!(
+                "{}: references {} which is superseded",
+                r.file, r.doc_id
+            )),
+            Some(_) => None,
         })
         .collect()
 }

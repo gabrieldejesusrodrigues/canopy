@@ -32,7 +32,18 @@ pub fn ensure_scaffold(repo_worktree: &Path) -> Result<bool> {
     let gi = repo_worktree.join(".gitignore");
     let cur = std::fs::read_to_string(&gi).unwrap_or_default();
     if !cur.lines().any(|l| l.trim() == ".canopy/") {
-        std::fs::write(&gi, format!("{}{}.canopy/\n", cur, if cur.is_empty() || cur.ends_with('\n') { "" } else { "\n" }))?;
+        std::fs::write(
+            &gi,
+            format!(
+                "{}{}.canopy/\n",
+                cur,
+                if cur.is_empty() || cur.ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                }
+            ),
+        )?;
         changed = true;
     }
     Ok(changed)

@@ -62,21 +62,33 @@ impl AgentCli for StubCli {
             .context("CANOPY_STUB_DIR env var not set — broken test setup")?;
         let stub_dir = std::path::Path::new(&stub_dir);
 
-        let stub_name = find_stub_marker(&req.prompt).with_context(|| {
+        // Resolution order: role-specific beats generic, marker beats default.
+        // Mechanism roles (merger/reviewer) see node specs inside their prompt,
+        // so the marker alone is ambiguous — `<marker>.<role>.md` disambiguates.
+        // Harness-generated specs (fix nodes, decomposer) carry no marker and
+        // fall back to `default.<role>.md` / `default.md`.
+        let role = req.role.as_str();
+        let marker = find_stub_marker(&req.prompt);
+        let mut candidates = Vec::new();
+        if let Some(m) = marker {
+            candidates.push(format!("{m}.{role}.md"));
+            candidates.push(format!("{m}.md"));
+        }
+        candidates.push(format!("default.{role}.md"));
+        candidates.push("default.md".to_string());
+        let mut raw = None;
+        for c in &candidates {
+            if let Ok(content) = tokio::fs::read_to_string(stub_dir.join(c)).await {
+                raw = Some(content);
+                break;
+            }
+        }
+        let raw = raw.with_context(|| {
             format!(
-                "no stub marker (stub:[a-z0-9_-]+) found in prompt — broken test setup\nprompt: {}",
+                "no stub file found (tried {candidates:?}) — broken test setup\nprompt head: {}",
                 &req.prompt[..req.prompt.len().min(200)]
             )
         })?;
-        let stub_file = stub_dir.join(format!("{stub_name}.md"));
-        let raw = tokio::fs::read_to_string(&stub_file)
-            .await
-            .with_context(|| {
-                format!(
-                    "stub file not found: {} — broken test setup",
-                    stub_file.display()
-                )
-            })?;
 
         let final_message = apply_touch_directives(&raw, &req.workdir).await?;
 
@@ -225,7 +237,43 @@ mod tests {
         };
 
         let err = StubCli.invoke(&req).await.unwrap_err();
-        assert!(err.to_string().contains("stub marker"));
+        assert!(err.to_string().contains("no stub file found"));
+    }
+
+    #[tokio::test]
+    async fn role_specific_beats_generic_and_default_covers_markerless() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let stub_dir = TempDir::new().unwrap();
+        let work_dir = TempDir::new().unwrap();
+        let transcript_tmp = TempDir::new().unwrap();
+
+        fs::write(stub_dir.path().join("job.md"), "generic").unwrap();
+        fs::write(stub_dir.path().join("job.merger.md"), "merger view").unwrap();
+        fs::write(stub_dir.path().join("default.executor.md"), "default exec").unwrap();
+        std::env::set_var("CANOPY_STUB_DIR", stub_dir.path());
+
+        let mut req = InvocationRequest {
+            role: Role::Merger,
+            node_id: "n".into(),
+            prompt: "conflict for stub:job here".into(),
+            model: "stub".into(),
+            workdir: work_dir.path().to_path_buf(),
+            timeout_secs: 30,
+            max_turns: None,
+            transcript_path: transcript_tmp.path().join("t1.txt"),
+        };
+        let r = StubCli.invoke(&req).await.unwrap();
+        assert_eq!(r.final_message, "merger view");
+
+        req.role = Role::Executor;
+        req.transcript_path = transcript_tmp.path().join("t2.txt");
+        let r = StubCli.invoke(&req).await.unwrap();
+        assert_eq!(r.final_message, "generic"); // no job.executor.md → generic
+
+        req.prompt = "no marker at all (harness-generated fix node)".into();
+        req.transcript_path = transcript_tmp.path().join("t3.txt");
+        let r = StubCli.invoke(&req).await.unwrap();
+        assert_eq!(r.final_message, "default exec");
     }
 
     #[tokio::test]
@@ -249,6 +297,6 @@ mod tests {
         };
 
         let err = StubCli.invoke(&req).await.unwrap_err();
-        assert!(err.to_string().contains("stub file not found"));
+        assert!(err.to_string().contains("no stub file found"));
     }
 }
