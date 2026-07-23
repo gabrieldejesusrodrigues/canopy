@@ -49,23 +49,60 @@ pub struct Scheduler {
     reviews: HashMap<String, ReviewAgg>,
     /// node → context injected on retry (verify failures, bounces).
     retry_ctx: HashMap<String, String>,
-    /// Executor-reported megafile flags, applied when the node LANDS — its
-    /// own flag must not gate its own merge, and the decomposer must split
-    /// the file with this node's changes already in.
-    pending_flags: HashMap<String, Vec<String>>,
-    /// Declared breaks (mechanism 5): verify failure lands + propagates as
-    /// fix nodes instead of bouncing.
-    declared_breaks: HashMap<String, Vec<BreakNote>>,
-    /// Merge-conflict count per file: the merge queue is where every
-    /// collision surfaces, so it doubles as the megafile mechanism's
-    /// contention sensor.
-    conflict_counts: HashMap<String, u32>,
-    /// planner node → replans consumed.
-    replans: HashMap<String, u32>,
+    /// Crash-surviving coordination context (persisted to
+    /// .canopy/swarm-state.json, same pattern as the blocklist).
+    st: SwarmState,
     paused_for_budget: bool,
     /// Applications that write to the merge worktree (design docs), deferred
     /// while a merge job is in flight — the merge lane owns that checkout.
     pending: Vec<Deferred>,
+}
+
+/// Coordination context that must survive a crash: flags and breaks waiting
+/// for their node to land, the contention sensor's counters, and consumed
+/// replans. "All state on the board" — this is the scheduler-private slice,
+/// kept as state-dir JSON exactly like the megafile blocklist.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct SwarmState {
+    /// Owning run — state from a previous run in the same repo is discarded
+    /// (its node ids are dead and its conflict counts would poison the sensor).
+    #[serde(default)]
+    run_id: String,
+    /// node → executor-reported megafile flags, applied when the node LANDS
+    /// (its own flag must not gate its own merge, and the decomposer must
+    /// split the file with this node's changes already in).
+    pending_flags: HashMap<String, Vec<String>>,
+    /// node → declared breaks (mechanism 5): verify failure lands +
+    /// propagates as fix nodes instead of bouncing.
+    declared_breaks: HashMap<String, Vec<BreakNote>>,
+    /// file → merge-conflict count (mechanism 4's contention sensor).
+    conflict_counts: HashMap<String, u32>,
+    /// planner node → replans consumed (REPLAN_CAP).
+    replans: HashMap<String, u32>,
+}
+
+impl SwarmState {
+    fn path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("swarm-state.json")
+    }
+
+    fn load(dir: &std::path::Path) -> SwarmState {
+        std::fs::read_to_string(Self::path(dir))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, dir: &std::path::Path) {
+        match serde_json::to_string(self) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(Self::path(dir), json) {
+                    tracing::warn!("swarm-state persist failed: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("swarm-state serialize failed: {e}"),
+        }
+    }
 }
 
 enum Deferred {
@@ -168,6 +205,13 @@ impl Scheduler {
                 .await?;
         }
         let blocklist = BlockList::load(&cfg.state_dir())?;
+        let mut st = SwarmState::load(&cfg.state_dir());
+        if st.run_id != run.id {
+            st = SwarmState {
+                run_id: run.id.clone(),
+                ..Default::default()
+            };
+        }
 
         tracing::info!(run = run.id, branch = run.branch, "canopy run starting");
         println!(
@@ -191,10 +235,7 @@ impl Scheduler {
             inflight: HashSet::new(),
             reviews: HashMap::new(),
             retry_ctx: HashMap::new(),
-            pending_flags: HashMap::new(),
-            declared_breaks: HashMap::new(),
-            conflict_counts: HashMap::new(),
-            replans: HashMap::new(),
+            st,
             paused_for_budget: false,
             pending: Vec::new(),
         };
@@ -218,8 +259,9 @@ impl Scheduler {
             if self.jobs.is_empty() && matches!(root.state, NodeState::Done | NodeState::Failed) {
                 let report = self.ledger.report(&self.run.id)?;
                 println!("{report}");
+                let wall = (chrono::Utc::now() - self.run.created_at).num_seconds() as f64 / 60.0;
                 println!(
-                    "run {} finished: root {}. Branch `{}` is ready to inspect/PR.",
+                    "run {} finished: root {} in {wall:.1} min wall. Branch `{}` is ready to inspect/PR.",
                     self.run.id,
                     root.state.as_str(),
                     self.run.branch
@@ -334,6 +376,7 @@ impl Scheduler {
             let cfg = self.cfg.clone();
             let run_branch = self.run.branch.clone();
             let breaks = self
+                .st
                 .declared_breaks
                 .get(&node.id)
                 .cloned()
@@ -592,6 +635,13 @@ impl Scheduler {
     // ------------------------------------------------------------------
 
     async fn apply(&mut self, out: JobOut) -> Result<()> {
+        let res = self.apply_inner(out).await;
+        // Every apply may have mutated crash-surviving context — persist.
+        self.st.save(&self.cfg.state_dir());
+        res
+    }
+
+    async fn apply_inner(&mut self, out: JobOut) -> Result<()> {
         match out {
             JobOut::Tree {
                 node,
@@ -827,8 +877,8 @@ impl Scheduler {
                 .insert(node.id.clone(), reason.chars().take(2000).collect());
             self.tracker.set_state(&node.id, NodeState::Ready).await?;
         } else {
-            self.pending_flags.remove(&node.id);
-            self.declared_breaks.remove(&node.id);
+            self.st.pending_flags.remove(&node.id);
+            self.st.declared_breaks.remove(&node.id);
             // A dead decomposer must not leave its file blocked forever;
             // the post-merge scan re-flags it if it is still fat.
             let lifted = self.blocklist.lift_for_node(&node.id)?;
@@ -972,10 +1022,10 @@ impl Scheduler {
                 // node's changes already landed. Breaks let a verify failure
                 // land + propagate (mechanism 5) instead of bouncing.
                 if !out.flagged_files.is_empty() {
-                    self.pending_flags.insert(node.id.clone(), out.flagged_files);
+                    self.st.pending_flags.insert(node.id.clone(), out.flagged_files);
                 }
                 if !out.breaks.is_empty() {
-                    self.declared_breaks.insert(node.id.clone(), out.breaks);
+                    self.st.declared_breaks.insert(node.id.clone(), out.breaks);
                 }
                 self.tracker
                     .set_state(&node.id, NodeState::NeedsMerge)
@@ -1017,10 +1067,10 @@ impl Scheduler {
     /// scan remains the durable trigger).
     async fn record_conflicts(&mut self, files: &[String]) -> Result<()> {
         for f in files {
-            let n = self.conflict_counts.entry(f.clone()).or_insert(0);
+            let n = self.st.conflict_counts.entry(f.clone()).or_insert(0);
             *n += 1;
             if *n >= CONFLICT_DECOMPOSE_THRESHOLD {
-                self.conflict_counts.remove(f);
+                self.st.conflict_counts.remove(f);
                 tracing::info!(file = f, "repeated merge conflicts — flagging for decomposition");
                 self.flag_and_decompose(f).await?;
             }
@@ -1253,8 +1303,8 @@ impl Scheduler {
                 self.tracker
                     .comment(&node.id, "no commits produced — nothing to merge")
                     .await?;
-                self.pending_flags.remove(&node.id);
-                self.declared_breaks.remove(&node.id);
+                self.st.pending_flags.remove(&node.id);
+                self.st.declared_breaks.remove(&node.id);
                 // An empty decomposer landing lifts its block — the post-merge
                 // scan re-flags the file if it is still fat.
                 let lifted = self.blocklist.lift_for_node(&node.id)?;
@@ -1315,7 +1365,7 @@ impl Scheduler {
                 }
                 // Executor-reported flags apply now that the node has landed,
                 // then the post-merge scan flags (mechanism 4).
-                for f in self.pending_flags.remove(&node.id).unwrap_or_default() {
+                for f in self.st.pending_flags.remove(&node.id).unwrap_or_default() {
                     self.flag_and_decompose(&f).await?;
                 }
                 for f in megafiles {
@@ -1334,7 +1384,7 @@ impl Scheduler {
                 // Mechanism 5: a declared break landed and verify now fails —
                 // the failure becomes fix work instead of a bounce.
                 if let Some(tail) = verify_debt {
-                    let breaks = self.declared_breaks.remove(&node.id).unwrap_or_default();
+                    let breaks = self.st.declared_breaks.remove(&node.id).unwrap_or_default();
                     let reasons = breaks
                         .iter()
                         .map(|b| format!("- {}: {}", b.file, b.reason))
@@ -1367,7 +1417,7 @@ impl Scheduler {
                         })
                         .await?;
                 } else {
-                    self.declared_breaks.remove(&node.id);
+                    self.st.declared_breaks.remove(&node.id);
                 }
                 self.tracker
                     .set_state(&node.id, NodeState::InReview)
@@ -1516,9 +1566,9 @@ impl Scheduler {
             return Ok(());
         }
         let any_failed = children.iter().any(|c| c.state == NodeState::Failed);
-        let used = *self.replans.get(&parent_id).unwrap_or(&0);
+        let used = *self.st.replans.get(&parent_id).unwrap_or(&0);
         if any_failed && used < REPLAN_CAP {
-            self.replans.insert(parent_id.clone(), used + 1);
+            self.st.replans.insert(parent_id.clone(), used + 1);
             let summary = children
                 .iter()
                 .map(|c| {
@@ -1583,6 +1633,7 @@ impl Scheduler {
         for p in parents {
             Box::pin(self.settle_parent(p.id)).await?;
         }
+        self.st.save(&self.cfg.state_dir());
         Ok(())
     }
 

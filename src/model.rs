@@ -275,7 +275,7 @@ pub struct ExecutorOutput {
     pub breaks: Vec<BreakNote>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BreakNote {
     pub file: String,
     pub reason: String,

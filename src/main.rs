@@ -51,6 +51,9 @@ enum Cmd {
     Status {
         #[arg(long)]
         run: Option<String>,
+        /// Refresh the tree every 3s (live view of a running swarm)
+        #[arg(long)]
+        watch: bool,
     },
     /// Article-style economics report (tokens vs cost, by role and model)
     Report {
@@ -74,9 +77,19 @@ async fn main() -> Result<()> {
             let cfg = config::Config::load(&cli.config)?;
             scheduler::Scheduler::start(cfg, objective, resume).await
         }
-        Cmd::Status { run } => {
+        Cmd::Status { run, watch } => {
             let cfg = config::Config::load(&cli.config)?;
-            status(&cfg, run).await
+            if !watch {
+                return status(&cfg, run).await;
+            }
+            loop {
+                // Clear + home, then the same tree the one-shot path prints.
+                print!("\x1b[2J\x1b[H");
+                if let Err(e) = status(&cfg, run.clone()).await {
+                    println!("status error: {e:#}");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
         }
         Cmd::Report { run } => {
             let cfg = config::Config::load(&cli.config)?;
@@ -183,6 +196,7 @@ async fn print_subtree(tracker: &dyn tracker::Tracker, node_id: &str, depth: usi
     let marker = match node.state {
         NodeState::Done => "✓",
         NodeState::Failed => "✗",
+        NodeState::Superseded => "⊘",
         NodeState::Running | NodeState::Merging => "▶",
         NodeState::Blocked => "⏸",
         _ => "·",

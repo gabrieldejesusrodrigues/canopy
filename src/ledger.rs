@@ -97,12 +97,13 @@ impl Ledger {
         for (label, group) in [("by role", "role"), ("by model", "cli || ':' || model")] {
             out.push_str(&format!("\n== Spend {label} ==\n"));
             out.push_str(&format!(
-                "{:<34} {:>6} {:>12} {:>8} {:>10} {:>7} {:>8} {:>8}\n",
-                "group", "calls", "tokens", "tok %", "cost USD", "cost %", "agt min", "unpriced"
+                "{:<34} {:>6} {:>12} {:>8} {:>12} {:>10} {:>7} {:>8} {:>8}\n",
+                "group", "calls", "tokens", "tok %", "cached", "cost USD", "cost %", "agt min", "unpriced"
             ));
             let sql = format!(
                 "SELECT {group} AS g, COUNT(*), SUM(input_tokens+output_tokens),
-                        COALESCE(SUM(cost_usd),0), SUM(cost_usd IS NULL), SUM(duration_ms)
+                        COALESCE(SUM(cost_usd),0), SUM(cost_usd IS NULL), SUM(duration_ms),
+                        SUM(cached_tokens)
                  FROM invocations WHERE run_id=?1 GROUP BY g ORDER BY 4 DESC"
             );
             let mut stmt = conn.prepare(&sql)?;
@@ -114,16 +115,18 @@ impl Ledger {
                     r.get::<_, f64>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
                 ))
             })?;
             for row in rows {
-                let (g, calls, toks, cost, unpriced, dur_ms) = row?;
+                let (g, calls, toks, cost, unpriced, dur_ms, cached) = row?;
                 out.push_str(&format!(
-                    "{:<34} {:>6} {:>12} {:>7.1}% {:>10.4} {:>6.1}% {:>8.1} {:>8}\n",
+                    "{:<34} {:>6} {:>12} {:>7.1}% {:>12} {:>10.4} {:>6.1}% {:>8.1} {:>8}\n",
                     g,
                     calls,
                     toks,
                     pct(toks as f64, total_tokens as f64),
+                    cached,
                     cost,
                     pct(cost, total),
                     dur_ms as f64 / 60_000.0,

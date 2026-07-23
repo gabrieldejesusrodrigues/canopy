@@ -79,7 +79,11 @@ canopy report          # article-style economics: tokens% vs cost% per role/mode
 
 Interrupt any time (ctrl-c); `canopy run --resume <run-id>` picks the run back up.
 The swarm works on branch `canopy/run-<ts>` of the target repo — merging it to main
-stays a human decision.
+stays a human decision. Supervision, live watch and reset: [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+> **Security**: leaf agents run headless with no interactive approval
+> (`bypassPermissions` / sandbox equivalents). Treat objectives as trusted input;
+> the verify command runs repo code — same trust boundary as CI.
 
 ## Model routing
 
