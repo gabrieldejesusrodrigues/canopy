@@ -20,10 +20,13 @@ input + stderr message), unittest suites, discoverable via `python3 -m unittest 
 | B3² | opus 4.8 solo | **$0.48** | 1.6 min | 29 pass | ✅ all |
 | A4³ | canopy (2 lenses), 15-file objective | **$3.29** | ~12 min | **83 pass** | ✅ all |
 | B4³ | opus 4.8 solo, same objective | **$0.80** | 2.8 min | 66 pass | ✅ all |
+| A5⁴ | canopy swarm: opus trunk + sonnet leaves | **$3.68** | 13.7 min | 85 pass | ✅ all |
+| B5⁴ | canopy swarm: opus everywhere | **$3.50** | 12.3 min | **95 pass** | ✅ all |
 
 ¹ excluding a host-side daemon kill mid-run (see Crash recovery below).
 ² round 3, post-fixes harness (commits bd9cd30/0026f68/9a9413a).
 ³ round 4, width probe ("taskflow", 8 modules + suites — see its section below).
+⁴ round 5, swarm-vs-swarm routing comparison (the article's own experiment — see below).
 
 **Battery** (identical, scripted): valid adds; bad date / negative amount / empty category
 → exit 2 + stderr; summary sorted desc with 2 decimals; `--month` filters; corrupt JSON →
@@ -153,6 +156,53 @@ from leaf commits.
 - Two operational papercuts, both fixed in this pass: the release binary used for the
   run predated the `cached`/wall-time additions (report re-run with the new binary),
   and reviewer turn budgets inherited the executor's 50 (now capped at 20).
+
+## Round 5 — the article's own comparison: routed vs frontier-everywhere
+
+Both arms are canopy swarms on the taskflow objective; the ONLY config delta is the
+executor model. This is Cursor's $10,565-vs-$1,339 experiment at bonsai scale.
+
+| arm | leaves | cost | wall | tests | battery |
+|---|---|---|---|---|---|
+| A5: opus trunk + **sonnet** leaves | 7 | **$3.68** | 13.7 min | 85 | ✅ 23/23 |
+| B5: **opus everywhere** | 5 | **$3.50** | 12.3 min | 95 | ✅ 23/23 |
+
+**The routed arm saved nothing — it cost 5% more.** Sonnet leaves ARE cheaper per leaf
+($0.33 vs $0.51, −36%), but the planner's decomposition varied (7 leaves vs 5), and each
+extra leaf buys a cold start, a merge, and two lens landings (14 vs 10 review calls,
+$0.87 vs $0.56). At this scale **tree shape dominates leaf price**; the article's ~8×
+needs leaf work volume that dwarfs coordination overhead. n=1 per arm — decomposition
+nondeterminism could flip a 5% delta either way; the structural conclusion (shape >
+rate at small width) is the robust part.
+
+### Deep source review (not just tests)
+
+Read every module of both arms side by side; differences verified with runtime probes:
+
+| probe | A5 sonnet | B5 opus |
+|---|---|---|
+| `task list --due-before 2026-99-99` | exit 0, silently wrong | **exit 2** ✓ |
+| `report --today garbage` | exit 0, silently wrong | **exit 2** ✓ |
+| state file = valid JSON, not a dict | **StorageError, exit 2** ✓ | uncaught TypeError, exit 1 |
+| `--status bogus` as list filter | silent empty | silent empty (both weak) |
+
+**Opus leaves wrote visibly higher-craft code**: contract-grade docstrings on every
+module and function; canonical date parsing (round-trip check) reused for *query inputs*
+(hence the two probe wins); a shared `validate_status` helper where sonnet duplicated
+the check inline; ids allocated only after validation (sonnet mutates `next_id` before
+validating — in-memory-state-on-failure smell); defensive copies from `list_projects`;
+exception chaining and `BaseException` temp-file cleanup; `--help` text on every
+subcommand. Sonnet's arm is leaner (1,148 vs 1,418 LOC) and its `_run_mutating` helper
+is DRYer than opus's repeated load/save — but four of its five review findings were the
+kind of gaps opus didn't make (missing design refs, construct-then-mutate).
+
+**And one robustness bug only the opus arm has**: `load_state` trusts any valid JSON —
+a non-dict state file crashes with a raw traceback where sonnet's shape check returns a
+clean StorageError. Craft and blind spots are orthogonal; neither lens caught it.
+
+**Net**: quality edge to opus leaves (real but confined to edge cases and craft — every
+user-facing behavior tied), cost edge to nobody. At this width, pick leaves for quality,
+not price; the price argument only turns on when leaves outnumber coordination.
 
 ## Crash recovery, validated in anger
 
