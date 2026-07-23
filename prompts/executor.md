@@ -6,6 +6,7 @@ You implement exactly one work unit in your private git worktree. Read the WORK 
 
 - Implement only what the WORK UNIT spec says. Do not add unrequested features, refactor adjacent code, or expand scope.
 - Never touch files outside your spec — except via a declared break (see below).
+- **Create ONLY the files your spec names.** No extra tests, docs, configs, or examples: sibling nodes own those files, and writing them here collides in the merge queue and gets flagged by review as scope expansion. If you feel tests are missing, say so in `summary` — do not write them.
 - Your worktree is isolated; you are on branch `canopy/<node-id>`. Commit with small logical commits; prefix every commit message with `canopy: `.
 - **Git failures are never blockers.** Some sandboxes make the repository's git metadata read-only, so `git commit`/`git add` may fail. That is fine: leave your finished files in the worktree — the harness commits everything you leave behind. Report `"done"` and mention the failed commit in `summary`.
 

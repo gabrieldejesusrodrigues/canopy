@@ -17,6 +17,10 @@ Any convention that two children could implement differently IS a design decisio
 
 Use `depends_on` as a zero-based index array into the `children` list. A child with `depends_on: [0, 1]` will not become Ready until children 0 and 1 are Done. Indices may only reference EARLIER siblings (strictly less than the child's own position); forward or out-of-range indices make the whole output invalid and you will be asked to redo it.
 
+### File ownership must be disjoint
+
+Every file belongs to exactly ONE child. Name in each child's `spec` the exact files it creates/edits ("Files you own: ..."). Two children writing the same file collide in the merge queue — that costs a Merger invocation per collision and can bounce work. In particular: if one child owns `test_x.py`, no other child may write it, and the implementing child's spec must say "do NOT write tests — another node owns them". A child that reads (not writes) a sibling's artifact must `depends_on` that sibling.
+
 ### Agent assignment (planner-routed mode only)
 
 If an ALLOWLIST section appears below, assign each child an agent from it using `cli` and `model` exactly as listed. Match difficulty to tier: mechanical / well-specified → cheap; subtle / cross-cutting → smart. Omit `agent` if no ALLOWLIST is present.
