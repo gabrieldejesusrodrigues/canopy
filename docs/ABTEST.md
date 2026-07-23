@@ -1,7 +1,9 @@
 # A/B: swarm harness vs solo agent — 2026-07-23
 
-Same feature, four arms. **A** arms build with canopy (plan → parallel leaves → serialized
-merges → review lens); **B** arms are one `claude -p` call with the same objective text.
+Same feature, six arms across three rounds. **A** arms build with canopy (plan → parallel
+leaves → serialized merges → review lens); **B** arms are one `claude -p` call with the
+same objective text. Round 3 ran AFTER the round-1-driven fixes landed (enforced disjoint
+`files[]` ownership, merger triage ladder, contention sensor, `agt min` metric).
 
 **Feature ("explog")**: expense tracker in stdlib Python — `errors.py` (ValidationError /
 StorageError), `storage.py` (atomic JSON writes, StorageError on corrupt file), `core.py`
@@ -14,8 +16,11 @@ input + stderr message), unittest suites, discoverable via `python3 -m unittest 
 | B1 | sonnet solo | **$0.44** | 1.5 min | 35 pass | ✅ all |
 | A2 | canopy: opus 4.8 planner + sonnet leaves + agy review | **$1.34** | ~20 min¹ | 21 pass | ✅ all |
 | B2 | opus 4.8 solo | **$0.43** | 1.4 min | 32 pass | ✅ all |
+| A3² | canopy, same as A2 + all round-1 fixes + haiku merger triage | **$1.66** | ~11 min | **37 pass** | ✅ all |
+| B3² | opus 4.8 solo | **$0.48** | 1.6 min | 29 pass | ✅ all |
 
 ¹ excluding a host-side daemon kill mid-run (see Crash recovery below).
+² round 3, post-fixes harness (commits bd9cd30/0026f68/9a9413a).
 
 **Battery** (identical, scripted): valid adds; bad date / negative amount / empty category
 → exit 2 + stderr; summary sorted desc with 2 decimals; `--month` filters; corrupt JSON →
@@ -62,6 +67,30 @@ paid for three times (conflict, review, fix). Shipped:
 Round 2 (planned by opus with proper `depends_on` sequencing, before the contract fix
 even landed): **zero conflicts, zero merger spend, clean review**. The failure mode and
 its fix are both visible in the numbers.
+
+## Round 3 — the fixes, measured
+
+Round 3 reran the round-2 matchup on the post-fix harness (enforced `files[]`
+ownership, rerere + haiku triage ladder, contention sensor, `agt min` column).
+
+- **The ownership contract changed the planner's decomposition shape.** Every leaf spec
+  now reads "Files you own: storage.py, test_storage.py. Do NOT edit …" — and the
+  planner paired each module WITH its tests under one owner instead of round 2's
+  separate test node. Disjoint by construction: **zero conflicts for the second
+  consecutive round**, the triage tier configured but never needed. The best merger
+  spend is none.
+- **First round where the harness arm out-tested the solo arm: 37 vs 29.** Pairing each
+  module with its own tests in one leaf produced the highest test count of all six arms
+  (A1 20 → A2 21 → A3 37). The contract written to prevent conflicts also bought
+  per-module test depth.
+- **The richer contract costs planner tokens**: the opus planning call went from $0.23
+  (A2) to $0.54 (A3) — it now emits ownership lists and design docs with more care.
+  Worth it: that $0.31 bought the conflict-free shape and the test-depth win.
+- **`agt min` makes the latency overhead visible**: A3 spent 4.7 agent-minutes
+  (2.5 exec + 1.9 plan + 0.3 review) vs B3's 1.6 — plus queue serialization on top
+  (~11 min wall). The cost verdict is unchanged: solo remains ~3.5× cheaper and ~7×
+  faster at single-feature scale; the harness arms keep the artifacts (3 design docs
+  cited by leaves, per-leaf commits, reviewed merges) and now beat solo on test depth.
 
 ## Crash recovery, validated in anger
 
