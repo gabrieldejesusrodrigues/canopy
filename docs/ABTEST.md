@@ -323,6 +323,73 @@ ties it on user-facing quality — the shape the article promised, at bonsai sca
 arm, so decomposition nondeterminism could shift the exact percentages on a repeat; the
 probe-level quality closure and the per-call lens cost drop are mechanism-level, not luck.
 
+## Round 7 — 3×3, and what variance actually is
+
+Round 6 was n=1 per arm. To characterize the *distribution* (not one sample) we ran the
+same two configs **three times each** — A = opus trunk + sonnet leaves, B = opus
+everywhere — on identical fresh repos. Both arms share the same opus planner, so the six
+runs are really one decomposition distribution sampled six times.
+
+| run | leaves | cost | wall | tests | battery | high findings |
+|---|---|---|---|---|---|---|
+| a1 sonnet | 9 | $4.66 | 11.4 | 61 | ✅ | 4 |
+| a2 sonnet | 6 | $3.57 | 12.4 | 89 | ✅ | 1 |
+| a3 sonnet | 5 | $2.43 | 9.3 | 85 | ✅ | 0 |
+| b1 opus | 5 | $2.83 | 9.4 | 103 | ✅ | 0 |
+| b2 opus | 5 | $2.85 | 9.2 | 59 | ✅ | 0 |
+| b3 opus | 7 | $3.91 | 11.2 | 121 | ✅ | 2 |
+
+**The tree shape is the trunk's decision, and it is the dominant cost lever — bigger than
+the executor model.** The opus planner decomposed this one objective into `{5,5,5,6,7,9}`
+leaves (median 5.5, range 5–9), and cost tracks leaf count almost linearly. Controlling for
+shape — the three 5-leaf runs — the routed arm is cheaper: **a3 $2.43 vs b1/b2 $2.83/$2.85,
+~15% less**, the clean apples-to-apples result. But across the full sample the shape draw
+dominates: the sonnet arm happened to draw high (9, 6) and ended with a *higher* mean
+($3.55) than the opus arm ($3.20). Round 6's "routed is 35% cheaper" was a lucky low draw
+(4 leaves); the honest statement is **routed is ~15% cheaper at equal shape, and shape
+variance (±2 leaves) swings a single run's cost more than the model choice does.**
+
+### Quality: read the code, not the test count
+
+All six pass the 23-check battery and their whole unit suite. Test *counts* are noise and
+actively misleading: opus b2 wrote **59** tests, fewer than sonnet a2/a3 (89/85); opus b3
+wrote 121. What matters is *what* they tested.
+
+- **Robustness (state file = valid JSON, non-dict):** all 3 sonnet runs return a clean
+  StorageError (exit 2); **2 of 3 opus runs (b2, b3) crash with a raw traceback (exit 1).**
+  The cause is visible in the source: a3's `load_state` guards
+  `isinstance(state, dict) and required keys`, and its `test_storage.py` has
+  `test_json_list_raises_storage_error` (writes `[1,2,3]`, asserts StorageError). b2's
+  `load_state` is `return json.load(f)` with no shape check, and its tests never feed it a
+  non-dict. **The missing test is the crash.** Test count inverted the truth — b2 (fewer
+  tests) shipped the bug the more-tested-looking arm avoided.
+- **Validation (bad `--due-before` / `--today`):** all six exit 2. Both arms' `models`
+  reject bool-as-int (`isinstance(x, bool)` guard) and impossible calendar dates (strptime
+  rejects `2026-02-30`). The round-5 gap is closed everywhere.
+- **Craft edge to opus, locally:** b2's `models.py` carries module/function docstrings,
+  `canopy-design:` refs, and validates `id`/`project_id` types that a3 skips. So a3 won
+  storage robustness; b2 won models craft. Neither arm dominates — the differences track
+  run-to-run variance more than the model tier.
+- **A recurring, arm-independent gap:** `save_state` catches only `OSError`, so a
+  `json.dumps` failure (a non-serializable state) leaks the temp file instead of raising
+  `StorageError`. It appears in sonnet (a1, flagged) and opus (b3, flagged; a3, present but
+  unflagged) alike — an *uncollapsed spec ambiguity* (the objective never says what happens
+  when serialization itself fails), the same class of defect as the round-5 date bug, one
+  level up. The fix is planner-side: specify it.
+- **Review lens is not blinded by push-context:** it caught fd-leaks on Windows, temp-file
+  cleanup on non-`OSError`, and whitespace-normalized duplicate-name bypasses — sophisticated
+  findings, at ~$0.06/call.
+
+### The lever, restated
+
+The trunk owns the tree shape; the shape is the biggest single knob on cost *and* the thing
+that varies most run-to-run. Making leaves cheaper (routing) buys ~15% at fixed shape;
+making the trunk decide shape *well and consistently* is worth more. Decomposition still
+ranges 5–9 on an 8-module objective — the next lever is a more prescriptive decomposition
+contract ("one leaf per cohesive module named in the objective, tests included") to pull
+that range in, plus collapsing the remaining edge-case ambiguities (serialization-failure
+policy, non-dict state) in the spec so neither model has to guess.
+
 ## Crash recovery, validated in anger
 
 The A2 daemon was killed by the host mid-run (leaf claimed, work half-done). Twenty-five
