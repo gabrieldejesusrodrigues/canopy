@@ -10,6 +10,18 @@ Expensive models plan (**trunks**); cheap models execute explicit instructions (
 In Cursor's experiments this delivered equivalent quality at ~8× lower cost — their
 GPT-5.5-everywhere run cost $10,565 while Opus-planner + cheap-executor cost $1,339.
 
+### Why "canopy"?
+
+The article's swarm is a forest: **trunks** hold the structure and never touch a leaf's
+work; **leaves** do the photosynthesis. A *canopy* is what emerges when many trees grow
+side by side — the continuous living layer that captures all the light, which no single
+tree can form alone. Real canopies even exhibit **crown shyness**: neighboring crowns
+grow wide yet leave polite gaps instead of tangling — which is precisely this harness's
+job. Disjoint file ownership keeps crowns from overlapping, the merge queue is where
+branches meet without breaking, replans close the gap when a tree falls, and the field
+guide is the forest floor that remembers. canopy is the layer above your agent trees
+that makes them behave like one forest.
+
 ## How it works
 
 ```
