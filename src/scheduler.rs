@@ -477,6 +477,10 @@ impl Scheduler {
                     node.attempt,
                     rc.lens.as_str()
                 ));
+                // Reviews are one read-and-report pass; the executor turn
+                // budget would let a lens wander the repo on the meter
+                // ("reviewing is far cheaper than the work being audited").
+                req.max_turns = Some(req.max_turns.map_or(20, |t| t.min(20)));
                 let node_c = node.clone();
                 let lens = rc.lens;
                 let ar = agent_ref.clone();

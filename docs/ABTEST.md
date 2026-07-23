@@ -18,9 +18,12 @@ input + stderr message), unittest suites, discoverable via `python3 -m unittest 
 | B2 | opus 4.8 solo | **$0.43** | 1.4 min | 32 pass | ✅ all |
 | A3² | canopy, same as A2 + all round-1 fixes + haiku merger triage | **$1.66** | ~11 min | **37 pass** | ✅ all |
 | B3² | opus 4.8 solo | **$0.48** | 1.6 min | 29 pass | ✅ all |
+| A4³ | canopy (2 lenses), 15-file objective | **$3.29** | ~12 min | **83 pass** | ✅ all |
+| B4³ | opus 4.8 solo, same objective | **$0.80** | 2.8 min | 66 pass | ✅ all |
 
 ¹ excluding a host-side daemon kill mid-run (see Crash recovery below).
 ² round 3, post-fixes harness (commits bd9cd30/0026f68/9a9413a).
+³ round 4, width probe ("taskflow", 8 modules + suites — see its section below).
 
 **Battery** (identical, scripted): valid adds; bad date / negative amount / empty category
 → exit 2 + stderr; summary sorted desc with 2 decimals; `--month` filters; corrupt JSON →
@@ -91,6 +94,65 @@ ownership, rerere + haiku triage ladder, contention sensor, `agt min` column).
   (~11 min wall). The cost verdict is unchanged: solo remains ~3.5× cheaper and ~7×
   faster at single-feature scale; the harness arms keep the artifacts (3 design docs
   cited by leaves, per-leaf commits, reviewed merges) and now beat solo on test depth.
+
+## Round 4 — width probe ("taskflow", 15 files)
+
+A 2× wider objective (8 interdependent modules + per-module unittest suites, precise CLI
+contract) to probe the crossover. A4: opus planner + sonnet leaves (max_parallel 3),
+haiku triage, TWO lenses (agy output + haiku codebase). B4: opus solo.
+
+| arm | cost | wall | tests | battery (23 checks) |
+|---|---|---|---|---|
+| A4 | **$3.29** | ~12 min | **83 pass** | ✅ identical, all pass |
+| B4 | **$0.80** | 2.8 min | 66 pass | ✅ identical, all pass |
+
+Run shape (A4): 1 opus plan → 5 sonnet leaves (3 in parallel, module-pairs + own tests,
+explicit disjoint ownership) → 5 serialized merges, **zero conflicts, zero retries,
+zero nudges** → 10 lens invocations → 3 low findings → root Done. 4 design docs, cited
+from leaf commits.
+
+### Analysis: cost
+
+- **The crossover is about context saturation, not width.** Solo scaled sublinearly
+  ($0.48 → $0.80 for ~2× the modules) because one context amortizes all reading; the
+  harness scaled linearly with leaves ($1.91 executors). At 15 files solo is still
+  comfortable — the gap (4.1×) didn't close. Next probe needs ~50+ files or long-horizon
+  iterative work where a single context degrades. Cost structure confirms the article's
+  scaling shape though: planner O(1) (22.8%), leaves O(width) (58%).
+- **Found: the codebase lens is O(width × repo) — a quadratic tax.** The haiku codebase
+  lens cost $0.63 (19% of the run, 48.5% of billed tokens): each landing re-read the
+  repo (one call: 807k cached-read + 19k output tokens, $0.27) and the repo grows with
+  every landing. *Fix applied*: the lens contract now scopes reading to `## FILES` +
+  direct imports, and reviewer invocations are capped at 20 turns. Projected: roughly
+  halves lens cost; re-measure next round.
+- The new `cached` report column made this visible: executors 1.95M cached reads,
+  reviewers 1.59M — the `tokens` column alone hid 97% of the real context volume.
+
+### Analysis: quality
+
+- **Harness out-tested solo again: 83 vs 66** (second consecutive round since the
+  ownership contract). Same functional score on the 23-check battery — both arms
+  implemented the CLI contract exactly (report lines, exit codes, filter composition,
+  archived-project guard, atomic writes).
+- **The agy output lens has produced zero findings across all rounds (~17 reviewed
+  landings)** while the haiku codebase lens caught 3 real (low) gaps in the same run.
+  Its output is well-formed (valid JSON, empty findings) — it works, it just doesn't
+  see much at Flash-Low tier with only spec+diff. Recommendation: make the second lens
+  a transcript lens on a cheap-but-stronger model, or accept it as a cheap tiebreaker.
+  Uncorrelated lenses only sum if each actually finds things.
+- The 3 low findings were all "missing canopy-design refs" — the lens catching what the
+  merge gate can't (the gate checks refs that exist; the lens notices refs that are
+  missing). Leaves cite DDs in commit messages but forget source comments; contract
+  emphasis may help, low stakes.
+
+### Analysis: bugs found
+
+- **None in the harness this round**: no retries, no nudge respawns, no lease expiries,
+  no conflicts; all terminal states correct; provenance clean. The round-1 bug class
+  (contract-driven false "blocked") did not reappear.
+- Two operational papercuts, both fixed in this pass: the release binary used for the
+  run predated the `cached`/wall-time additions (report re-run with the new binary),
+  and reviewer turn budgets inherited the executor's 50 (now capped at 20).
 
 ## Crash recovery, validated in anger
 

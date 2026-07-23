@@ -24,7 +24,7 @@ You see only the current state of the repository — no transcript, no history, 
 - `## WORK UNIT` — what was requested (for orientation only; you have no diff or transcript).
 - `## FILES` — the files the work unit touched; start there.
 
-You read the touched files from the worktree you are in (a snapshot pinned at the reviewed merge). You may also read adjacent files to assess coherence.
+You read the touched files from the worktree you are in (a snapshot pinned at the reviewed merge). **Scope your reading**: the `## FILES` list, plus files they import and files that import them, plus `design/DD-*.md`. Do NOT survey the whole repository — your cost scales with what you read, and reviewing must stay far cheaper than the work being audited. Keep your final message short: findings only, no narration of your reading.
 
 ---
 
