@@ -90,6 +90,8 @@ Any of the three CLIs can play any role — trunk/leaf is a role, not a vendor.
 mode = "static"                       # or "planner-routed"
 planner  = { cli = "claude", model = "opus" }
 executor = { cli = "codex",  model = "gpt-5.4-mini" }
+# conflicts climb a ladder: rerere (free) → triage (cheap) → merger (smart)
+merger_triage = { cli = "claude", model = "haiku" }
 reviewers = [
   { cli = "agy",    model = "Gemini 3.6 Flash (Low)", lens = "output" },
   { cli = "claude", model = "haiku",                  lens = "codebase" },

@@ -114,6 +114,9 @@ mode = "static"          # or "planner-routed"
 planner = { cli = "claude", model = "opus" }
 executor = { cli = "codex", model = "gpt-5.4-mini" }
 merger = { cli = "claude", model = "sonnet" }
+# Cheap first attempt on conflicts; `merger` takes over when it fails or its
+# resolution bounces on the post-merge gates.
+# merger_triage = { cli = "claude", model = "haiku" }
 reviewers = [
   { cli = "agy", model = "Gemini 3.6 Flash (Low)", lens = "output" },
   { cli = "claude", model = "haiku", lens = "codebase" },

@@ -232,6 +232,11 @@ pub struct ChildSpec {
     /// Indices into the same `children` array (siblings that must finish first).
     #[serde(default)]
     pub depends_on: Vec<usize>,
+    /// Files this child owns (creates/edits). The harness rejects
+    /// decompositions where two children claim the same path — the article's
+    /// "no two delegated subtrees decide the same question", applied to files.
+    #[serde(default)]
+    pub files: Vec<String>,
     /// Only honored in planner-routed mode, validated against the allowlist.
     #[serde(default)]
     pub agent: Option<AgentRef>,

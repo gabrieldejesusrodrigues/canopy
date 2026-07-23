@@ -19,7 +19,7 @@ Use `depends_on` as a zero-based index array into the `children` list. A child w
 
 ### File ownership must be disjoint
 
-Every file belongs to exactly ONE child. Name in each child's `spec` the exact files it creates/edits ("Files you own: ..."). Two children writing the same file collide in the merge queue — that costs a Merger invocation per collision and can bounce work. In particular: if one child owns `test_x.py`, no other child may write it, and the implementing child's spec must say "do NOT write tests — another node owns them". A child that reads (not writes) a sibling's artifact must `depends_on` that sibling.
+Every file belongs to exactly ONE child. List each child's files in its `files` array AND name them in its `spec` ("Files you own: ..."). **The harness rejects output where two children claim the same path** — you will be asked to redo it. Two children writing the same file collide in the merge queue — that costs a Merger invocation per collision and can bounce work. In particular: if one child owns `test_x.py`, no other child may write it, and the implementing child's spec must say "do NOT write tests — another node owns them". A child that reads (not writes) a sibling's artifact must `depends_on` that sibling.
 
 ### Agent assignment (planner-routed mode only)
 
@@ -44,6 +44,7 @@ Fields:
   - `title`: short imperative phrase.
   - `kind`: `"plan"` or `"execute"`.
   - `spec`: explicit, self-contained instructions the child can execute without any other context. Be precise about file paths, interfaces, and constraints.
+  - `files`: the exact repo-relative paths this child creates/edits. Must be disjoint across children (enforced).
   - `depends_on`: array of sibling indices (omit or `[]` if none).
   - `agent`: `{"cli": "...", "model": "..."}` — omit unless ALLOWLIST is present.
 - `design_decisions` (optional, default `[]`): decisions to record.
@@ -59,14 +60,16 @@ Fields:
     {
       "title": "Add SQLite ledger schema and insert",
       "kind": "execute",
-      "spec": "Create src/ledger.rs. Define table `invocations` with columns: node_id TEXT, role TEXT, cli TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, cached_tokens INTEGER, cost_usd REAL, duration_ms INTEGER, attempt INTEGER, exit_ok INTEGER. Implement `fn record(conn: &Connection, r: &InvocationRecord) -> Result<()>`. Use rusqlite. No ORM. See DD-1 for schema conventions.",
+      "spec": "Create src/ledger.rs. Define table `invocations` with columns: node_id TEXT, role TEXT, cli TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, cached_tokens INTEGER, cost_usd REAL, duration_ms INTEGER, attempt INTEGER, exit_ok INTEGER. Implement `fn record(conn: &Connection, r: &InvocationRecord) -> Result<()>`. Use rusqlite. No ORM. See DD-1 for schema conventions. Files you own: src/ledger.rs. Do NOT edit other files.",
+      "files": ["src/ledger.rs"],
       "depends_on": [],
       "agent": {"cli": "codex", "model": "gpt-5.1-codex-mini"}
     },
     {
       "title": "Wire ledger into scheduler invocation path",
       "kind": "execute",
-      "spec": "In src/scheduler.rs, after each agent invocation completes, call ledger::record with the returned InvocationRecord. Import ledger from src/ledger.rs (sibling 0 must be done first). Handle errors with a log-and-continue policy (do not abort the run on ledger failure). canopy-design: DD-1",
+      "spec": "In src/scheduler.rs, after each agent invocation completes, call ledger::record with the returned InvocationRecord. Import ledger from src/ledger.rs (sibling 0 must be done first). Handle errors with a log-and-continue policy (do not abort the run on ledger failure). canopy-design: DD-1. Files you own: src/scheduler.rs.",
+      "files": ["src/scheduler.rs"],
       "depends_on": [0],
       "agent": {"cli": "codex", "model": "gpt-5.1-codex-mini"}
     }

@@ -96,7 +96,36 @@ impl GitOps {
                 self.git_in(&md, &["checkout", branch]).await?;
             }
         }
+        // Free tier of the merge ladder: resolutions recorded once (by the
+        // Merger) replay automatically on repeated hunks — retry-on-new-base
+        // and fix-node cycles hit the same conflicts.
+        let _ = self
+            .git_in(&self.merge_dir(), &["config", "rerere.enabled", "true"])
+            .await;
         Ok(())
+    }
+
+    /// Conflict markers still present in the merge worktree's WORKING TREE.
+    /// Side-effect-free (unlike `merge_resolved`, which stages) — used to
+    /// detect that rerere already replayed a full resolution.
+    pub async fn worktree_has_markers(&self) -> Result<bool> {
+        let out = Command::new("git")
+            .args(["grep", "-l", "^<<<<<<< "])
+            .current_dir(self.merge_dir())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await?;
+        Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+    }
+
+    /// Drop recorded rerere resolutions for these paths: a resolution that
+    /// bounced on the post-merge gates must not be replayed on the redo.
+    pub async fn rerere_forget(&self, files: &[String]) {
+        for f in files {
+            let _ = self
+                .git_in(&self.merge_dir(), &["rerere", "forget", f])
+                .await;
+        }
     }
 
     pub fn snapshot_dir(&self, tag: &str) -> PathBuf {

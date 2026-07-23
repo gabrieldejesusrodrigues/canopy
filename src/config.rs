@@ -120,6 +120,12 @@ pub struct Routing {
     pub executor: AgentRef,
     /// Default to planner if absent: mechanisms lean smart.
     pub merger: Option<AgentRef>,
+    /// Cheap first-attempt merger. Most conflicts left after disjoint
+    /// ownership are mechanical; the article's merge agent is "impartial and
+    /// efficient, similar to the way merge queues work" — queues are
+    /// mechanical first. On failure (or a resolution that bounces on the
+    /// post-merge gates) the main `merger` takes over.
+    pub merger_triage: Option<AgentRef>,
     pub reconciler: Option<AgentRef>,
     /// Default to executor if absent: mechanical splitting is leaf work.
     pub decomposer: Option<AgentRef>,

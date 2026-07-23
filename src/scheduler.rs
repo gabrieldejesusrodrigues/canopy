@@ -23,8 +23,10 @@ use crate::model::*;
 use crate::prompt;
 use crate::tracker::Tracker;
 
-const MERGER_MAX_TRIES: u32 = 2;
 const REPLAN_CAP: u32 = 2;
+/// A file that keeps causing merge conflicts is the article's "site of
+/// constant collisions" — decompose it regardless of line count.
+const CONFLICT_DECOMPOSE_THRESHOLD: u32 = 2;
 
 pub struct Scheduler {
     cfg: Arc<Config>,
@@ -53,6 +55,10 @@ pub struct Scheduler {
     /// Declared breaks (mechanism 5): verify failure lands + propagates as
     /// fix nodes instead of bouncing.
     declared_breaks: HashMap<String, Vec<BreakNote>>,
+    /// Merge-conflict count per file: the merge queue is where every
+    /// collision surfaces, so it doubles as the megafile mechanism's
+    /// contention sensor.
+    conflict_counts: HashMap<String, u32>,
     /// planner node → replans consumed.
     replans: HashMap<String, u32>,
     paused_for_budget: bool,
@@ -119,13 +125,19 @@ enum MergeReport {
         reason: String,
     },
     /// Conflict the Merger couldn't fix → retry node on the new base.
-    ConflictFailed,
+    ConflictFailed {
+        files: Vec<String>,
+    },
     Landed {
         commit: String,
         megafiles: Vec<String>,
         /// Verify failed but the node declared breaks: land anyway, the
         /// failure tail becomes fix work (mechanism 5's "compiler").
         verify_debt: Option<String>,
+        /// Files that needed conflict resolution to land (conflict-frequency
+        /// sensor input) and which ladder tier resolved them.
+        conflicted: Vec<String>,
+        resolved_by: Option<String>,
     },
     Error(String),
 }
@@ -208,6 +220,7 @@ impl Scheduler {
             retry_ctx: HashMap::new(),
             pending_flags: HashMap::new(),
             declared_breaks: HashMap::new(),
+            conflict_counts: HashMap::new(),
             replans: HashMap::new(),
             paused_for_budget: false,
             pending: Vec::new(),
@@ -736,6 +749,15 @@ impl Scheduler {
                             .iter()
                             .enumerate()
                             .all(|(i, c)| c.depends_on.iter().all(|ix| *ix < i))
+                    })
+                    // File ownership must be disjoint (article: "no two
+                    // delegated subtrees decide the same question").
+                    .filter(|out| match ownership_overlap(&out.children) {
+                        Some(overlap) => {
+                            tracing::warn!(node = node.id, overlap, "decomposition rejected");
+                            false
+                        }
+                        None => true,
                     });
                 match parsed {
                     Some(out) if self.merge_inflight => {
@@ -757,7 +779,8 @@ impl Scheduler {
                     None if !was_nudged => {
                         let nudged = prompt::json_retry_nudge(
                             &prompt_used,
-                            "missing, invalid, or depends_on referencing a non-earlier sibling",
+                            "missing, invalid, depends_on referencing a non-earlier sibling, \
+                             or two children owning the same file",
                         );
                         self.respawn_with_prompt(node, agent_ref, nudged).await
                     }
@@ -1013,6 +1036,24 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Conflict-frequency sensor: every collision surfaces at the merge
+    /// queue, so repeat offenders are, by observation, the article's "site of
+    /// constant collisions" — decompose them without waiting for the line
+    /// threshold. Counts are process-local (a resume restarts them; the line
+    /// scan remains the durable trigger).
+    async fn record_conflicts(&mut self, files: &[String]) -> Result<()> {
+        for f in files {
+            let n = self.conflict_counts.entry(f.clone()).or_insert(0);
+            *n += 1;
+            if *n >= CONFLICT_DECOMPOSE_THRESHOLD {
+                self.conflict_counts.remove(f);
+                tracing::info!(file = f, "repeated merge conflicts — flagging for decomposition");
+                self.flag_and_decompose(f).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn flag_and_decompose(&mut self, file: &str) -> Result<()> {
         if !self.blocklist.flag(file)? {
             return Ok(());
@@ -1260,8 +1301,9 @@ impl Scheduler {
                 self.fail_attempt(node, &format!("merge bounced: {reason}"))
                     .await?;
             }
-            MergeReport::ConflictFailed => {
+            MergeReport::ConflictFailed { files } => {
                 self.git.remove_worktree(&node.id).await.ok();
+                self.record_conflicts(&files).await?;
                 self.fail_attempt(
                     node,
                     "merge conflict unresolved by merger — retrying on new base",
@@ -1277,11 +1319,26 @@ impl Scheduler {
                 commit,
                 megafiles,
                 verify_debt,
+                conflicted,
+                resolved_by,
             } => {
                 self.tracker
                     .comment(&node.id, &format!("merged as {commit}"))
                     .await?;
                 self.git.remove_worktree(&node.id).await.ok();
+                if !conflicted.is_empty() {
+                    self.tracker
+                        .comment(
+                            &node.id,
+                            &format!(
+                                "conflict on {} file(s) resolved by {}",
+                                conflicted.len(),
+                                resolved_by.as_deref().unwrap_or("merger")
+                            ),
+                        )
+                        .await?;
+                    self.record_conflicts(&conflicted).await?;
+                }
                 // Executor-reported flags apply now that the node has landed,
                 // then the post-merge scan flags (mechanism 4).
                 for f in self.pending_flags.remove(&node.id).unwrap_or_default() {
@@ -1577,6 +1634,52 @@ fn kind_str(k: NodeKind) -> &'static str {
     }
 }
 
+/// First file claimed by two different children, if any. Empty `files`
+/// lists are allowed (the contract asks for them; older planners may omit).
+fn ownership_overlap(children: &[ChildSpec]) -> Option<String> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (i, c) in children.iter().enumerate() {
+        for f in &c.files {
+            let key = f.trim().trim_start_matches("./").to_owned();
+            if key.is_empty() {
+                continue;
+            }
+            match seen.insert(key.clone(), i) {
+                Some(j) if j != i => {
+                    return Some(format!("children {j} and {i} both own `{key}`"));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn child(files: &[&str]) -> ChildSpec {
+        ChildSpec {
+            title: "t".into(),
+            kind: NodeKind::Execute,
+            spec: "s".into(),
+            depends_on: vec![],
+            files: files.iter().map(|s| s.to_string()).collect(),
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn ownership_overlap_detection() {
+        assert!(ownership_overlap(&[child(&["a.py"]), child(&["b.py"])]).is_none());
+        assert!(ownership_overlap(&[child(&["a.py"]), child(&["./a.py"])]).is_some());
+        // duplicates within ONE child are that child's own business
+        assert!(ownership_overlap(&[child(&["a.py", "a.py"])]).is_none());
+        assert!(ownership_overlap(&[child(&[]), child(&[])]).is_none());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The merge job: everything worktree-side for one node's merge, run as a
 // detached task. At most one in flight — the serialized queue.
@@ -1597,78 +1700,218 @@ async fn merge_job(
         if let Some(f) = bl.gate(&files, &node.id) {
             return Ok(MergeReport::Gated { file: f.to_owned() });
         }
-        let outcome = git.try_merge(&node.id, &run_branch).await?;
-        let commit = match outcome {
-            MergeOutcome::NothingToMerge => return Ok(MergeReport::Empty),
-            MergeOutcome::Merged { commit } => commit,
-            MergeOutcome::Conflicted { details } => {
-                // Mechanism 3: the neutral Merger.
-                let recent = git.recent_subjects(5).await.unwrap_or_default();
-                let mut resolved = false;
-                for _try in 0..MERGER_MAX_TRIES {
-                    let hunks = git.conflict_hunks().await.unwrap_or(details.clone());
-                    let conflict = format!(
-                        "Node \"{}\" (spec below) conflicts with the current run branch.\n\n### Node spec\n{}\n\n### Recent landings on the run branch (the other side)\n{}\n\n### Conflicted hunks\n{}",
-                        node.title, node.spec, recent, hunks
-                    );
-                    let fg = fieldguide::index_content(&git.merge_dir());
-                    let docs = designdocs::load_all(&git.merge_dir())?;
-                    let p = prompt::merger(&fg, &conflict, &docs);
-                    let agent_ref = cfg.merger();
-                    let tdir = cfg.state_dir().join("transcripts");
-                    let _ = std::fs::create_dir_all(&tdir);
-                    let req = InvocationRequest {
-                        role: Role::Merger,
-                        node_id: node.id.clone(),
-                        prompt: p,
-                        model: agent_ref.model.clone(),
-                        workdir: git.merge_dir(),
-                        timeout_secs: cfg.budgets.agent_timeout_secs,
-                        max_turns: cfg.budgets.max_turns,
-                        transcript_path: tdir.join(format!("{}-merge.txt", node.id)),
-                    };
-                    match agent::for_ref(&agent_ref).invoke(&req).await {
-                        Ok(inv) => {
-                            let ok = inv.exit_ok;
-                            let parsed = agent::trailing_json(&inv.final_message)
-                                .and_then(|j| serde_json::from_str::<MergerOutput>(j).ok());
-                            merger_runs.push((agent_ref, inv));
-                            // The Merger's own verdict counts: an explicit
-                            // resolved=false is a failure even if git looks
-                            // clean. Git state remains the positive gate.
-                            let declined = parsed.map(|o| !o.resolved).unwrap_or(false);
-                            if ok && !declined && git.merge_resolved().await? {
-                                resolved = true;
-                                break;
-                            }
-                        }
-                        Err(e) => tracing::warn!("merger invocation failed: {e:#}"),
-                    }
-                }
-                if !resolved {
-                    git.abort_merge().await?;
-                    return Ok(MergeReport::ConflictFailed);
-                }
-                git.finalize_merge(&node.id).await?
+
+        // The resolution ladder, cheapest tier first — the article's merge
+        // agent is "impartial and efficient, similar to the way merge queues
+        // work in engineering teams", and engineering merge queues are
+        // mechanical first (rerere), smart last. Without a configured triage
+        // tier the smart merger simply gets both attempts, as before.
+        let ladder: Vec<AgentRef> = match &cfg.routing.merger_triage {
+            Some(t) => vec![t.clone(), cfg.merger()],
+            None => vec![cfg.merger(), cfg.merger()],
+        };
+
+        let once = merge_once(&cfg, &git, &node, &run_branch, &ladder, &mut merger_runs).await?;
+        let (commit, conflicted, resolved_by) = match once {
+            MergeOnce::Empty => return Ok(MergeReport::Empty),
+            MergeOnce::Failed { files } => {
+                git.abort_merge().await?;
+                return Ok(MergeReport::ConflictFailed { files });
             }
+            MergeOnce::Committed {
+                commit,
+                conflicted,
+                resolved_by,
+            } => (commit, conflicted, resolved_by),
         };
 
         // Post-merge gates: any ERROR from here on must revert the landed
         // commit — otherwise the retry sees "nothing to merge" and the work
         // lands unverified and unreviewed.
-        match post_merge_gates(&cfg, &git, &commit, &files, &breaks).await {
-            Ok(report) => Ok(report),
+        let mut gates = match post_merge_gates(&cfg, &git, &commit, &files, &breaks).await {
+            Ok(report) => report,
             Err(e) => {
                 if let Err(rev) = git.revert_merge(&commit).await {
                     tracing::error!("revert after gate error failed: {rev:#}");
                 }
-                Err(e)
+                return Err(e);
+            }
+        };
+
+        // Escalation: a triage-tier resolution that bounced on the gates gets
+        // ONE redo by the top-tier merger before the node pays with a full
+        // re-execution. Forget the recorded resolution first or rerere would
+        // replay the bad one.
+        let triaged = cfg.routing.merger_triage.is_some()
+            && resolved_by.as_deref().is_some_and(|r| r != "rerere")
+            && !conflicted.is_empty();
+        if triaged && matches!(gates, MergeReport::Bounced { .. }) {
+            git.rerere_forget(&conflicted).await;
+            let top = vec![cfg.merger()];
+            match merge_once(&cfg, &git, &node, &run_branch, &top, &mut merger_runs).await? {
+                MergeOnce::Committed {
+                    commit,
+                    conflicted,
+                    resolved_by,
+                } => {
+                    gates = match post_merge_gates(&cfg, &git, &commit, &files, &breaks).await {
+                        Ok(report) => report,
+                        Err(e) => {
+                            if let Err(rev) = git.revert_merge(&commit).await {
+                                tracing::error!("revert after gate error failed: {rev:#}");
+                            }
+                            return Err(e);
+                        }
+                    };
+                    if let MergeReport::Landed {
+                        conflicted: c,
+                        resolved_by: r,
+                        ..
+                    } = &mut gates
+                    {
+                        *c = conflicted;
+                        *r = resolved_by;
+                    }
+                    return Ok(gates);
+                }
+                MergeOnce::Failed { files } => {
+                    git.abort_merge().await?;
+                    return Ok(MergeReport::ConflictFailed { files });
+                }
+                MergeOnce::Empty => return Ok(MergeReport::Empty),
             }
         }
+
+        if let MergeReport::Landed {
+            conflicted: c,
+            resolved_by: r,
+            ..
+        } = &mut gates
+        {
+            *c = conflicted;
+            *r = resolved_by;
+        }
+        Ok(gates)
     }
     .await
     .unwrap_or_else(|e: anyhow::Error| MergeReport::Error(format!("{e:#}")));
     (report, merger_runs)
+}
+
+enum MergeOnce {
+    Empty,
+    /// Conflict no ladder tier could resolve (caller aborts the merge).
+    Failed { files: Vec<String> },
+    Committed {
+        commit: String,
+        conflicted: Vec<String>,
+        resolved_by: Option<String>,
+    },
+}
+
+/// One pass through the merge + resolution ladder: mechanical (rerere) tier
+/// first, then each agent tier in `ladder`. Mechanism 3: leaves never resolve
+/// their own conflicts — "worker agents ... either overwrite the other change
+/// or abandon their own".
+async fn merge_once(
+    cfg: &Config,
+    git: &GitOps,
+    node: &Node,
+    run_branch: &str,
+    ladder: &[AgentRef],
+    merger_runs: &mut Vec<(AgentRef, InvocationResult)>,
+) -> Result<MergeOnce> {
+    let outcome = git.try_merge(&node.id, run_branch).await?;
+    let details = match outcome {
+        MergeOutcome::NothingToMerge => return Ok(MergeOnce::Empty),
+        MergeOutcome::Merged { commit } => {
+            return Ok(MergeOnce::Committed {
+                commit,
+                conflicted: Vec::new(),
+                resolved_by: None,
+            })
+        }
+        MergeOutcome::Conflicted { details } => details,
+    };
+    let conflicted: Vec<String> = details.lines().map(str::to_owned).collect();
+    // Capture hunks before anything stages the index (staging empties the
+    // unmerged set that hunk extraction reads from).
+    let hunks0 = git.conflict_hunks().await.unwrap_or_else(|_| details.clone());
+
+    // Tier 0, free: rerere already replayed a recorded resolution.
+    if !git.worktree_has_markers().await? && git.merge_resolved().await? {
+        let commit = git.finalize_merge(&node.id).await?;
+        return Ok(MergeOnce::Committed {
+            commit,
+            conflicted,
+            resolved_by: Some("rerere".into()),
+        });
+    }
+
+    let recent = git.recent_subjects(5).await.unwrap_or_default();
+    for agent_ref in ladder {
+        let hunks = {
+            let h = git.conflict_hunks().await.unwrap_or_default();
+            if h.trim().is_empty() {
+                hunks0.clone()
+            } else {
+                h
+            }
+        };
+        let conflict = format!(
+            "Node \"{}\" (spec below) conflicts with the current run branch.\n\n### Node spec\n{}\n\n### Recent landings on the run branch (the other side)\n{}\n\n### Conflicted hunks\n{}",
+            node.title, node.spec, recent, hunks
+        );
+        let fg = fieldguide::index_content(&git.merge_dir());
+        // Context diet: only design docs the conflicted files or the node
+        // spec actually reference — not the whole design/ folder.
+        let mut docs = designdocs::load_all(&git.merge_dir())?;
+        let cited: std::collections::HashSet<String> =
+            designdocs::scan_refs(&git.merge_dir(), &conflicted)
+                .into_iter()
+                .map(|r| r.doc_id)
+                .collect();
+        docs.retain(|d| cited.contains(&d.meta.id) || node.spec.contains(&d.meta.id));
+        let p = prompt::merger(&fg, &conflict, &docs);
+        let tdir = cfg.state_dir().join("transcripts");
+        let _ = std::fs::create_dir_all(&tdir);
+        let req = InvocationRequest {
+            role: Role::Merger,
+            node_id: node.id.clone(),
+            prompt: p,
+            model: agent_ref.model.clone(),
+            workdir: git.merge_dir(),
+            timeout_secs: cfg.budgets.agent_timeout_secs,
+            max_turns: cfg.budgets.max_turns,
+            transcript_path: tdir.join(format!("{}-merge.txt", node.id)),
+        };
+        match agent::for_ref(agent_ref).invoke(&req).await {
+            Ok(inv) => {
+                let ok = inv.exit_ok;
+                let parsed = agent::trailing_json(&inv.final_message)
+                    .and_then(|j| serde_json::from_str::<MergerOutput>(j).ok());
+                merger_runs.push((agent_ref.clone(), inv));
+                // The Merger's own verdict counts: an explicit resolved=false
+                // is a failure even if git looks clean. Git state remains the
+                // positive gate.
+                let declined = parsed.map(|o| !o.resolved).unwrap_or(false);
+                if ok && !declined && git.merge_resolved().await? {
+                    let commit = git.finalize_merge(&node.id).await?;
+                    return Ok(MergeOnce::Committed {
+                        commit,
+                        conflicted,
+                        resolved_by: Some(format!(
+                            "{}:{}",
+                            agent_ref.cli.as_str(),
+                            agent_ref.model
+                        )),
+                    });
+                }
+            }
+            Err(e) => tracing::warn!("merger invocation failed: {e:#}"),
+        }
+    }
+    Ok(MergeOnce::Failed { files: conflicted })
 }
 
 /// Everything between "the merge commit exists" and "it may stay": field
@@ -1736,6 +1979,8 @@ async fn post_merge_gates(
                 commit: commit.to_owned(),
                 megafiles: megafiles().await?,
                 verify_debt: Some(out),
+                conflicted: Vec::new(),
+                resolved_by: None,
             });
         }
         git.revert_merge(commit).await?;
@@ -1748,5 +1993,7 @@ async fn post_merge_gates(
         commit: commit.to_owned(),
         megafiles: megafiles().await?,
         verify_debt: None,
+        conflicted: Vec::new(),
+        resolved_by: None,
     })
 }

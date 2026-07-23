@@ -54,12 +54,32 @@ enough context to resolve conflicts themselves.
 **Article solution.** "A neutral third-party agent intervenes on merge conflicts and
 resolves them on behalf of all parties. Its only goal is to be impartial and efficient."
 
-**Canopy.** Merges into the run branch are strictly serialized (§4 of DESIGN.md). On
-`git merge` conflict the harness spawns a **Merger** in the merge worktree with: the
-conflicted hunks, both node specs, both summaries, and referenced design docs. Its
-contract states impartiality explicitly and forbids expanding scope beyond resolving
-the conflict. If the Merger fails twice, the younger branch's node is requeued with the
-merged state as its new base (rebase-and-retry), which is what a human merge queue does.
+**Canopy.** Merges into the run branch are strictly serialized (§4 of DESIGN.md). The
+article's merge agent is "impartial and *efficient*, similar to the way merge queues
+work in engineering teams" — and engineering merge queues are mechanical first, smart
+last. Conflicts climb a resolution ladder:
+
+1. **rerere** (free): resolutions the Merger recorded replay automatically on repeated
+   hunks — retry-on-new-base and fix-node cycles hit the same conflicts.
+2. **Triage merger** (cheap model, optional `routing.merger_triage`): most conflicts
+   surviving disjoint ownership are mechanical.
+3. **Merger** (smart, the final authority): if a triage resolution later bounces on the
+   post-merge gates, its recorded resolution is forgotten and this tier redoes the merge
+   once before the node pays with a re-execution.
+
+Whichever tier runs is a *neutral third party* in the merge worktree — leaves never
+resolve their own conflicts ("worker agents … either overwrite the other change or
+abandon their own"). Context per invocation: conflicted hunks, the node's spec, recent
+landings on the run branch, and only the design docs the conflicted files actually cite.
+If no tier resolves, the node is requeued with the merged state as its new base
+(rebase-and-retry), which is what a human merge queue does.
+
+The real cost lever is upstream, and the article says so with numbers — its old runs
+"accumulated 70,000+ conflicts", the new ones "fewer than 1,000". Canopy enforces the
+same prevention: planners must declare each child's `files`, decompositions where two
+children claim the same path are rejected outright ("we require them to ensure that no
+two delegated subtrees decide the same question"), and the merge queue doubles as a
+contention sensor (§4).
 
 ## 4. Megafiles → flag, block, decompose
 
@@ -68,9 +88,13 @@ merged state as its new base (rebase-and-retry), which is what a human merge que
 **Article solution.** "Worker agents flag bloated files. Once flagged, we block new
 commits and an outside agent decomposes the overgrown file into smaller modules."
 
-**Canopy.** Two flag paths: executors return `flagged_files` (applied when the flagging
-node *lands*, so a node's own flag never gates its own merge), and the harness
-hard-scans line counts post-merge (`megafile_lines` threshold, default 1000). A flagged
+**Canopy.** Three flag paths: executors return `flagged_files` (applied when the
+flagging node *lands*, so a node's own flag never gates its own merge); the harness
+hard-scans line counts post-merge (`megafile_lines` threshold, default 1000); and the
+merge queue acts as a **contention sensor** — a file involved in repeated merge
+conflicts is flagged regardless of size, because the article's megafile symptom is
+being "the site of constant collisions" and the serialized queue is where every
+collision surfaces. A flagged
 file enters the **block list**: the merge queue skips any candidate whose diff touches
 it (the node waits in `NeedsMerge`, no state churn). A **Decomposer** node is created
 for the file (cheap model, explicit split instructions); the block lifts when the
