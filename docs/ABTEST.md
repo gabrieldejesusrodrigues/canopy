@@ -390,6 +390,58 @@ contract ("one leaf per cohesive module named in the objective, tests included")
 that range in, plus collapsing the remaining edge-case ambiguities (serialization-failure
 policy, non-dict state) in the spec so neither model has to guess.
 
+## Round 8 — swarm vs solo (canopy Opus+Sonnet vs solo Opus)
+
+The earlier rounds compared two *swarms*. This one asks the sharper question: is the swarm
+worth it at all versus a single Opus agent with no harness? A = the three canopy runs from
+round 7 (opus trunk + sonnet leaves, a1/a2/a3). B = **solo Opus**: one `claude -p --model
+opus` agent, same objective, same fresh repo, told to write everything and make the tests
+pass — no planner, no leaves, no reviewers, no merge queue.
+
+| arm | run | cost | wall | LOC | tests | battery | invalid-date input (P1/P2) |
+|---|---|---|---|---|---|---|---|
+| A canopy O+S | a1 | $4.66 | 11.4 | 994 | 61 | ✅ | exit 2 ✓ |
+| A canopy O+S | a2 | $3.57 | 12.4 | 1140 | 89 | ✅ | exit 2 ✓ |
+| A canopy O+S | a3 | $2.43 | 9.3 | 1201 | 85 | ✅ | exit 2 ✓ |
+| B solo Opus | s1 | $1.03 | 2.7 | 986 | 58 | ✅ | exit 2 ✓ |
+| B solo Opus | s2 | $0.70 | 2.3 | 931 | 65 | ✅ | **exit 1 (crash)** |
+| B solo Opus | s3 | $0.74 | 2.5 | 962 | 55 | ✅ | **exit 0 (silent)** |
+
+**Cost and speed: solo wins decisively.** Solo Opus averaged **$0.82** and **2.5 min**;
+canopy Opus+Sonnet averaged **$3.55** and **~11 min** — the swarm is ~4.3× more expensive
+and ~4.4× slower for one bounded feature that fits a single context. This is the article's
+own boundary: routing/swarming pays off at scale (work too big for one context, parallel
+throughput), not on a single feature where coordination overhead — planner + reviewers +
+merges + per-leaf context re-acquisition — dominates.
+
+**Consistency of edge-case correctness: canopy wins.** All six pass the 23-check battery
+(functional tie). But on the untrusted-input edge (`--due-before 2026-99-99`, `--today
+garbage`), the three canopy runs were **3/3 correct** (clean exit 2), while the three solo
+Opus runs were **1 correct, 1 crash, 1 silent-wrong**. Reading the code shows three
+*different* architectures the solo agent invented for the same ambiguity:
+
+- **s1**: shared `models.parse_date`, called at the boundary, `ValidationError` mapped to
+  exit 2. Correct.
+- **s2**: no shared validator; a private `_as_date` using `date.fromisoformat`, which
+  raises `ValueError` — but `cli.py` catches only `(ValidationError, NotFoundError,
+  StorageError)`, so it escapes uncaught → traceback, exit 1.
+- **s3**: no validation at all — raw string comparison `task["due"] < due_before`. Invalid
+  input silently accepted, exit 0.
+
+That is the article's thesis in its purest form: resolving the ambiguity is a judgment
+call, and **even Opus resolves it inconsistently across runs when working solo from the raw
+objective.** canopy's trunk collapses that decision once ("validate at the boundary through
+the shared `parse_date`") and every leaf — even a cheaper Sonnet one — follows it, so the
+swarm's *cheaper* arm was *more reliable* on this edge than solo *Opus*. And test counts
+(55–65) again failed to predict it: the solo failures trace to a test gap — s2/s3 never
+exercised `task list --due-before <invalid>` end to end.
+
+**When to use which.** Solo Opus for a single well-scoped feature that fits one context —
+far cheaper and faster, but you are rolling dice on whatever the objective left unspecified.
+canopy when the work is too big for one context (parallel throughput, resumability) or when
+you need *consistent, auditable* handling of the decisions a solo agent would otherwise make
+ad hoc — the trunk pins them down once so every leaf obeys.
+
 ## Crash recovery, validated in anger
 
 The A2 daemon was killed by the host mid-run (leaf claimed, work half-done). Twenty-five
