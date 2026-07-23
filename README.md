@@ -59,7 +59,7 @@ that makes them behave like one forest.
 | 3 | Neutral third-party merge agent | conflict → impartial Merger resolves in the merge worktree |
 | 4 | Megafile flag → block → decompose | executor flags + post-merge line scan → merges touching the file bounce until a Decomposer splits it |
 | 5 | Permitted breaks (anti-ossification) | `canopy-break: <reason>` + `breaks[]`; verify propagates; failures become fix nodes |
-| 6 | Layered review lenses | transcript / output / codebase lenses on different CLIs+models; high findings spawn fix nodes |
+| 6 | Layered review lenses | transcript / output / codebase (+ opt-in test-adequacy) lenses on different CLIs+models; high findings spawn fix nodes |
 
 Plus the **Field Guide** (stigmergy): `fieldguide/index.md` is injected into *every* agent
 prompt; agents curate it; the only rule is a line budget — enforced at merge time.
@@ -130,10 +130,13 @@ to model tier — the harness validates every assignment against the allowlist.
 ## Economics guardrails
 
 `[budgets]`: `max_usd` (hard stop → run pauses, resumable), `max_parallel`,
-`max_parallel_planners`, `max_attempts`, `max_tree_depth`, `agent_timeout_secs`,
-`max_turns`. Every invocation is recorded (tokens, cost, duration, role, model) in a
-local ledger; `canopy report` shows whether you're getting the article's shape —
-**leaves own most tokens, trunks own most cost.**
+`max_parallel_planners`, `max_attempts`, `max_tree_depth`, `max_children` (reject a
+decomposition wider than this — caps the cost variance of over-splitting),
+`agent_timeout_secs`, `max_turns`. Every invocation is recorded (tokens, cost, duration,
+role, model) in a local ledger; `canopy report` shows whether you're getting the article's
+shape — **leaves own most tokens, trunks own most cost** — plus a **quality shape**
+(decomposition width, re-attempts, review findings by severity) so a bad-draw run is
+visible, not just its bill.
 
 ## Development
 

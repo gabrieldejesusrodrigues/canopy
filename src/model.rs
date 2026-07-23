@@ -145,6 +145,8 @@ pub enum Lens {
     Output,
     /// Repo state only, no history.
     Codebase,
+    /// Touched source + tests: does the suite exercise the code's failure modes?
+    TestAdequacy,
 }
 
 impl Lens {
@@ -153,6 +155,7 @@ impl Lens {
             Lens::Transcript => "transcript",
             Lens::Output => "output",
             Lens::Codebase => "codebase",
+            Lens::TestAdequacy => "test_adequacy",
         }
     }
 }

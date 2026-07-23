@@ -456,7 +456,7 @@ impl Scheduler {
                 .routing
                 .reviewers
                 .iter()
-                .any(|r| r.lens == Lens::Codebase)
+                .any(|r| matches!(r.lens, Lens::Codebase | Lens::TestAdequacy))
             {
                 const CAP: usize = 48 * 1024;
                 let mut s = String::new();
@@ -525,7 +525,11 @@ impl Scheduler {
                 // codebase lens already has the touched bodies pushed inline, so
                 // it needs only a few turns to spot-check imports/DDs — cap it
                 // tighter than the diff/transcript lenses.
-                let cap = if rc.lens == Lens::Codebase { 8 } else { 20 };
+                let cap = if matches!(rc.lens, Lens::Codebase | Lens::TestAdequacy) {
+                    8
+                } else {
+                    20
+                };
                 req.max_turns = Some(req.max_turns.map_or(cap, |t| t.min(cap)));
                 let node_c = node.clone();
                 let lens = rc.lens;
@@ -813,6 +817,7 @@ impl Scheduler {
         let json = agent::trailing_json(&inv.final_message);
         match node.kind {
             NodeKind::Plan => {
+                let max_children = self.cfg.budgets.max_children;
                 let parsed = json
                     .and_then(|j| serde_json::from_str::<PlannerOutput>(j).ok())
                     // depends_on must reference earlier siblings only; a
@@ -832,6 +837,24 @@ impl Scheduler {
                             false
                         }
                         None => true,
+                    })
+                    // Cap over-splitting: each extra child is a cold start, a
+                    // merge, and a review landing per lens (cost is O(width)),
+                    // and decomposition width is the dominant source of
+                    // run-to-run cost variance. A single Execute child and an
+                    // empty replan (0 children) stay allowed.
+                    .filter(|out| {
+                        if out.children.len() > max_children {
+                            tracing::warn!(
+                                node = node.id,
+                                n = out.children.len(),
+                                max = max_children,
+                                "decomposition rejected: too many children"
+                            );
+                            false
+                        } else {
+                            true
+                        }
                     });
                 match parsed {
                     Some(out) if self.merge_inflight => {
@@ -854,7 +877,8 @@ impl Scheduler {
                         let nudged = prompt::json_retry_nudge(
                             &prompt_used,
                             "missing, invalid, depends_on referencing a non-earlier sibling, \
-                             or two children owning the same file",
+                             two children owning the same file, or more children than allowed \
+                             (consolidate into fewer, fuller children — roughly one per module)",
                         );
                         self.respawn_with_prompt(node, agent_ref, nudged).await
                     }

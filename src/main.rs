@@ -96,6 +96,13 @@ async fn main() -> Result<()> {
             let run_id = resolve_run(&cfg, run)?;
             let ledger = ledger::Ledger::open(&cfg.state_dir().join("ledger.db"))?;
             println!("{}", ledger.report(&run_id)?);
+            // Quality shape alongside the cost shape (sqlite boards only).
+            if cfg.run.tracker == "sqlite" {
+                match tracker::sqlite::quality_shape(&cfg.state_dir().join("canopy.db"), &run_id) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => eprintln!("quality shape unavailable: {e:#}"),
+                }
+            }
             Ok(())
         }
     }
@@ -115,6 +122,7 @@ max_parallel = 4
 max_parallel_planners = 2
 max_attempts = 3
 max_tree_depth = 4
+max_children = 7        # reject a planner decomposition wider than this (caps cost variance)
 lease_secs = 2400
 agent_timeout_secs = 1800
 max_turns = 50
@@ -134,6 +142,9 @@ merger = { cli = "claude", model = "sonnet" }
 reviewers = [
   { cli = "agy", model = "Gemini 3.6 Flash (Low)", lens = "output" },
   { cli = "claude", model = "haiku", lens = "codebase" },
+  # opt-in extra lens: audits whether tests exercise the code's failure modes
+  # (not coverage %). Catches untested error paths — the usual source of edge bugs.
+  # { cli = "claude", model = "haiku", lens = "test_adequacy" },
 ]
 
 # Used when mode = "planner-routed": the planner assigns each child an agent

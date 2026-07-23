@@ -14,6 +14,7 @@ const DECOMPOSER: &str = include_str!("../prompts/decomposer.md");
 const REVIEWER_TRANSCRIPT: &str = include_str!("../prompts/reviewer_transcript.md");
 const REVIEWER_OUTPUT: &str = include_str!("../prompts/reviewer_output.md");
 const REVIEWER_CODEBASE: &str = include_str!("../prompts/reviewer_codebase.md");
+const REVIEWER_TESTADEQUACY: &str = include_str!("../prompts/reviewer_testadequacy.md");
 
 fn assemble(fieldguide: &str, contract: &str, sections: &[(&str, &str)]) -> String {
     let mut s = String::new();
@@ -136,15 +137,16 @@ pub fn reviewer(
         Lens::Transcript => REVIEWER_TRANSCRIPT,
         Lens::Output => REVIEWER_OUTPUT,
         Lens::Codebase => REVIEWER_CODEBASE,
+        Lens::TestAdequacy => REVIEWER_TESTADEQUACY,
     };
     let files = touched_files.join("\n");
     let sections: Vec<(&str, &str)> = match lens {
-        // Codebase lens deliberately sees no diff/history — only the repo it
-        // sits in (its worktree), what unit was requested, which files that
-        // unit touched, and their full bodies pushed inline so it need not
-        // re-read them turn after turn (that re-acquisition was the lens's
+        // Codebase and test-adequacy lenses see no diff/history — only the repo
+        // they sit in (their worktree), what unit was requested, which files
+        // that unit touched, and their full bodies pushed inline so they need
+        // not re-read them turn after turn (that re-acquisition was the lens's
         // dominant cost). An empty FILE CONTENTS section is skipped by assemble.
-        Lens::Codebase => vec![
+        Lens::Codebase | Lens::TestAdequacy => vec![
             ("WORK UNIT", spec),
             ("FILES", &files),
             ("FILE CONTENTS", touched_contents),

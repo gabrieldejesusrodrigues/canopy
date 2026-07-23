@@ -213,6 +213,43 @@ impl SqliteTracker {
     }
 }
 
+/// Quality-shape of a run, read straight off the board — the counterpart to the
+/// ledger's cost report. Surfaces the signals a bad run hides: how wide the
+/// decomposition drew, how much was re-attempted, and how many findings landed.
+/// Read-only; a best-effort convenience for `canopy report` on sqlite boards.
+pub fn quality_shape(path: &Path, run_id: &str) -> Result<String> {
+    let conn = Connection::open(path).with_context(|| format!("opening board {path:?}"))?;
+    let count = |sql: &str| -> Result<i64> {
+        Ok(conn.query_row(sql, params![run_id], |r| r.get(0))?)
+    };
+    let leaves = count("SELECT COUNT(*) FROM nodes WHERE run_id=?1 AND kind='execute'")?;
+    let plans = count("SELECT COUNT(*) FROM nodes WHERE run_id=?1 AND kind='plan'")?;
+    let root_children = count(
+        "SELECT COUNT(*) FROM nodes WHERE run_id=?1 AND kind='execute' AND parent_id IN \
+         (SELECT id FROM nodes WHERE run_id=?1 AND parent_id IS NULL)",
+    )?;
+    let retries = count("SELECT COUNT(*) FROM nodes WHERE run_id=?1 AND attempt>0")?;
+    let done = count("SELECT COUNT(*) FROM nodes WHERE run_id=?1 AND state='done'")?;
+    let failed = count("SELECT COUNT(*) FROM nodes WHERE run_id=?1 AND state='failed'")?;
+    let superseded = count("SELECT COUNT(*) FROM nodes WHERE run_id=?1 AND state='superseded'")?;
+    let finds = |sev: &str| -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM comments c JOIN nodes n ON c.node_id=n.id \
+             WHERE n.run_id=?1 AND c.body LIKE ?2",
+            params![run_id, format!("%review [{sev}]%")],
+            |r| r.get(0),
+        )?)
+    };
+    let (high, low) = (finds("high")?, finds("low")?);
+    Ok(format!(
+        "\n== Quality shape ==\n\
+         decomposition: {root_children} top-level leaves ({leaves} execute nodes total, {plans} plan)\n\
+         states:        done={done} failed={failed} superseded={superseded}   re-attempted={retries}\n\
+         review:        {high} high, {low} low findings\n\
+         Wide decomposition (top-level leaves) drives cost; high findings + re-attempts flag rework.\n"
+    ))
+}
+
 #[async_trait]
 impl Tracker for SqliteTracker {
     async fn init_run(&self, objective: &str, branch: &str) -> Result<Run> {

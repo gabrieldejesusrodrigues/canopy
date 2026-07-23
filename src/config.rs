@@ -67,6 +67,10 @@ pub struct Budgets {
     /// Attempts per node before Failed.
     pub max_attempts: u32,
     pub max_tree_depth: u32,
+    /// Reject any planner decomposition with more than this many children
+    /// (caps the cost/quality variance of over-splitting). A single Execute
+    /// child and an empty replan are always allowed.
+    pub max_children: usize,
     /// Claim lease; expired claims return to Ready. Clamped at load time to
     /// at least 2×agent_timeout_secs + 300 (a claim can span two invocations:
     /// the run plus one JSON-nudge retry) so live jobs never lose their lease.
@@ -85,6 +89,7 @@ impl Default for Budgets {
             max_parallel_planners: 2,
             max_attempts: 3,
             max_tree_depth: 4,
+            max_children: 7,
             lease_secs: 2400,
             agent_timeout_secs: 1800,
             max_turns: Some(50),
