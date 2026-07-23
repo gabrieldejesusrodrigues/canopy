@@ -67,7 +67,9 @@ pub struct Budgets {
     /// Attempts per node before Failed.
     pub max_attempts: u32,
     pub max_tree_depth: u32,
-    /// Claim lease; expired claims return to Ready.
+    /// Claim lease; expired claims return to Ready. Clamped at load time to
+    /// at least 2×agent_timeout_secs + 300 (a claim can span two invocations:
+    /// the run plus one JSON-nudge retry) so live jobs never lose their lease.
     pub lease_secs: i64,
     /// Kill an agent process after this long.
     pub agent_timeout_secs: u64,
@@ -183,6 +185,15 @@ impl Config {
             .with_context(|| format!("target repo {}", cfg.run.repo.display()))?;
         if cfg.run.tracker == "linear" && cfg.linear.is_none() {
             anyhow::bail!("tracker = \"linear\" requires a [linear] section");
+        }
+        let min_lease = 2 * cfg.budgets.agent_timeout_secs as i64 + 300;
+        if cfg.budgets.lease_secs < min_lease {
+            tracing::warn!(
+                configured = cfg.budgets.lease_secs,
+                clamped = min_lease,
+                "lease_secs must outlive a claim (2×agent_timeout + 300) — clamped"
+            );
+            cfg.budgets.lease_secs = min_lease;
         }
         Ok(cfg)
     }

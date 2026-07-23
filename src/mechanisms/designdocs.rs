@@ -123,6 +123,8 @@ pub fn find_conflict<'a>(
 }
 
 /// Write a decision to design/. Returns the path. `id` must already be final.
+/// A known id keeps its existing file (one file per decision, ever — a
+/// rewrite must not leave two active docs for one id under different slugs).
 pub fn write_decision(
     repo_worktree: &Path,
     decision: &DesignDecision,
@@ -137,7 +139,11 @@ pub fn write_decision(
         status: "active".into(),
         author_node: author_node.to_owned(),
     };
-    let path = dir.join(format!("{}-{}.md", decision.id, slug(&decision.title)));
+    let path = load_all(repo_worktree)?
+        .into_iter()
+        .find(|d| d.meta.id == decision.id)
+        .map(|d| d.path)
+        .unwrap_or_else(|| dir.join(format!("{}-{}.md", decision.id, slug(&decision.title))));
     std::fs::write(&path, render(&meta, &decision.content))
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(path)

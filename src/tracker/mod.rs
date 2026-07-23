@@ -46,7 +46,11 @@ pub trait Tracker: Send + Sync {
     /// Return Running nodes whose lease expired to Ready. Returns count.
     async fn expire_leases(&self, run_id: &str, lease_secs: i64) -> Result<u32>;
 
-    /// Blocked nodes whose dependencies are all Done -> Ready. Returns count.
+    /// Dependency settlement, both directions:
+    /// - Blocked nodes whose dependencies are all Done -> Ready.
+    /// - Blocked nodes with any dependency Failed/Superseded -> Failed
+    ///   (a dead prerequisite can never satisfy; the parent replans).
+    /// Returns the count of nodes moved to Ready.
     async fn unblock_satisfied(&self, run_id: &str) -> Result<u32>;
 }
 

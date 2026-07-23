@@ -7,7 +7,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::model::{AgentRef, NewNode, Node, NodeKind, NodeState, Run};
+use crate::model::{AgentRef, NewNode, Node, NodeKind, NodeState, Role, Run};
 use crate::tracker::Tracker;
 
 // ---------------------------------------------------------------------------
@@ -106,6 +106,9 @@ pub struct Meta {
     pub agent: Option<AgentRef>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Mechanism role override (e.g. Decomposer); None = derived from kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_hint: Option<Role>,
     pub depth: u32,
     #[serde(default)]
     pub attempt: u32,
@@ -253,6 +256,10 @@ impl LinearTracker {
         state_map.insert("blocked".into(), pick("backlog")?);
         state_map.insert("done".into(), pick("completed")?);
         state_map.insert("failed".into(), pick("canceled")?);
+        // Superseded is terminal-settled (replaced during a replan); mirror it to
+        // the same Linear workflow state as canceled. The canopy metadata footer
+        // remains authoritative for the true state.
+        state_map.insert("superseded".into(), pick("canceled")?);
 
         Ok(Self {
             client,
@@ -383,6 +390,7 @@ impl LinearTracker {
             },
             agent: meta.agent,
             depends_on: meta.depends_on,
+            role_hint: meta.role_hint,
             depth: meta.depth,
             attempt: meta.attempt,
             claimed_at: meta.claimed_at,
@@ -395,12 +403,10 @@ impl LinearTracker {
 impl Tracker for LinearTracker {
     async fn init_run(&self, objective: &str, branch: &str) -> Result<Run> {
         // Truncate project name to 60 chars + timestamp for uniqueness.
+        // Char-boundary-safe: byte slicing panics on multi-byte UTF-8 (e.g. a
+        // Portuguese objective with accents).
         let ts = Utc::now().format("%Y%m%d-%H%M%S");
-        let short = if objective.len() > 60 {
-            &objective[..60]
-        } else {
-            objective
-        };
+        let short: String = objective.chars().take(60).collect();
         let project_name = format!("{short} [{ts}]");
 
         let data = self
@@ -431,6 +437,7 @@ impl Tracker for LinearTracker {
             state: NodeState::Ready,
             agent: None,
             depends_on: vec![],
+            role_hint: None,
             depth: 0,
             attempt: 0,
             claimed_at: None,
@@ -514,6 +521,7 @@ impl Tracker for LinearTracker {
             state,
             agent: new.agent.clone(),
             depends_on: new.depends_on.clone(),
+            role_hint: new.role_hint,
             depth: new.depth,
             attempt: 0,
             claimed_at: None,
@@ -552,6 +560,7 @@ impl Tracker for LinearTracker {
             spec: new.spec,
             agent: new.agent,
             depends_on: new.depends_on,
+            role_hint: new.role_hint,
             depth: new.depth,
             attempt: 0,
             claimed_at: None,
@@ -593,7 +602,7 @@ impl Tracker for LinearTracker {
     /// ponytail: no distributed lock — single-daemon guarantee documented in design
     async fn try_claim(&self, id: &str) -> Result<Option<Node>> {
         let data = self.gql(Q_ISSUE, json!({ "id": id })).await?;
-        let issue: IssueNode =
+        let mut issue: IssueNode =
             serde_json::from_value(data["issue"].clone()).context("parsing issue")?;
         let desc = issue.description.as_deref().unwrap_or("");
         let (body, existing_meta) = split_description(desc);
@@ -610,19 +619,21 @@ impl Tracker for LinearTracker {
         new_meta.claimed_at = Some(Utc::now());
         let state_id = self.linear_state_id(NodeState::Running);
         let new_desc = encode_description(body, &new_meta);
-        let resp = self
-            .gql(
-                M_ISSUE_UPDATE,
-                json!({
-                    "id": id,
-                    "input": { "description": new_desc, "stateId": state_id }
-                }),
-            )
-            .await?;
-        let updated_issue: IssueNode = serde_json::from_value(resp["issueUpdate"]["issue"].clone())
-            .context("parsing updated issue")?;
+        self.gql(
+            M_ISSUE_UPDATE,
+            json!({
+                "id": id,
+                "input": { "description": new_desc, "stateId": state_id }
+            }),
+        )
+        .await?;
+        // Build the returned Node from the PRE-READ issue (which carries
+        // parent { id }, unlike the issueUpdate selection set), rewriting only
+        // the description so the claimed state/claimed_at are reflected. Trusting
+        // the mutation response here would drop parent_id and break the cascade.
         let run_id = new_meta.run_id.clone();
-        Ok(Self::issue_to_node(updated_issue, &run_id))
+        issue.description = Some(new_desc);
+        Ok(Self::issue_to_node(issue, &run_id))
     }
 
     async fn transition(&self, id: &str, from: NodeState, to: NodeState) -> Result<bool> {
@@ -719,18 +730,37 @@ impl Tracker for LinearTracker {
     async fn unblock_satisfied(&self, run_id: &str) -> Result<u32> {
         let blocked = self.nodes_in_state(run_id, NodeState::Blocked).await?;
         let all = self.nodes_in_state_paginated(run_id, None).await?;
-        let done_ids: std::collections::HashSet<&str> = all
-            .iter()
-            .filter(|n| n.state == NodeState::Done)
-            .map(|n| n.id.as_str())
-            .collect();
+        let by_id: HashMap<&str, NodeState> =
+            all.iter().map(|n| (n.id.as_str(), n.state)).collect();
 
         let mut count = 0u32;
         for node in blocked {
+            // A dead prerequisite (failed/superseded) can never satisfy — settle
+            // the dependent Failed so the scheduler can cascade/replan.
+            let dead = node.depends_on.iter().find(|dep| {
+                matches!(
+                    by_id.get(dep.as_str()),
+                    Some(NodeState::Failed) | Some(NodeState::Superseded)
+                )
+            });
+            if let Some(dead_id) = dead {
+                let dead_state = by_id
+                    .get(dead_id.as_str())
+                    .map(|s| s.as_str())
+                    .unwrap_or("failed");
+                let body =
+                    format!("dependency {dead_id} is {dead_state}; marking this node failed");
+                let id = node.id.clone();
+                self.mutate_meta(&id, |m| m.state = NodeState::Failed)
+                    .await?;
+                self.comment(&id, &body).await?;
+                continue;
+            }
+
             let all_done = node
                 .depends_on
                 .iter()
-                .all(|dep| done_ids.contains(dep.as_str()));
+                .all(|dep| by_id.get(dep.as_str()) == Some(&NodeState::Done));
             if all_done {
                 let id = node.id.clone();
                 self.mutate_meta(&id, |m| m.state = NodeState::Ready)
@@ -816,6 +846,7 @@ mod tests {
                 model: "opus".into(),
             }),
             depends_on: vec!["dep-1".into(), "dep-2".into()],
+            role_hint: Some(Role::Decomposer),
             depth: 3,
             attempt: 2,
             claimed_at: None,
@@ -873,6 +904,7 @@ mod tests {
             NodeState::Blocked,
             NodeState::Done,
             NodeState::Failed,
+            NodeState::Superseded,
         ];
         for state in states {
             let mut meta = sample_meta();
@@ -940,6 +972,7 @@ mod tests {
             state: NodeState::Running,
             agent: None,
             depends_on: vec![],
+            role_hint: None,
             depth: 0,
             attempt: 1,
             claimed_at: None,
@@ -958,5 +991,21 @@ mod tests {
         assert_eq!(node.spec, "my spec");
         assert_eq!(node.depth, 0);
         assert_eq!(node.attempt, 1);
+        assert_eq!(node.role_hint, None);
+    }
+
+    #[test]
+    fn role_hint_roundtrips_through_footer() {
+        let mut meta = sample_meta();
+        meta.role_hint = Some(Role::Reviewer);
+        let desc = encode_description("spec", &meta);
+        let (_, parsed) = split_description(&desc);
+        assert_eq!(parsed.unwrap().role_hint, Some(Role::Reviewer));
+
+        // None must also round-trip (skipped in serialization, defaulted on parse).
+        meta.role_hint = None;
+        let desc = encode_description("spec", &meta);
+        let (_, parsed) = split_description(&desc);
+        assert_eq!(parsed.unwrap().role_hint, None);
     }
 }

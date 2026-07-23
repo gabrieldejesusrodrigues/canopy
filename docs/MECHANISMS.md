@@ -36,9 +36,11 @@ merges the docs and the references propagate the resolution downstream."
 
 **Canopy trigger.** On applying planner output, if a new decision's `topics` intersect
 an existing *active* doc from a different `author_node` — or two decisions land on the
-same `id` — the scheduler pauses child creation for both subtrees and spawns a
-**Reconciler** (smart-model role). It receives both docs, both planners' specs, and
+same `id` — the incoming doc is written under a fresh id and a **Reconciler**
+(smart-model role) is spawned. It receives both docs *and both planners' specs*, and
 must output a single merged doc (one `id` survives; the other is marked `superseded`).
+If the Reconciler fails or returns garbage, the incumbent wins: the incoming doc is
+marked superseded — two active contradicting docs never coexist.
 
 **Propagation downstream.** The design-ref check now fails for every file referencing
 the superseded doc; each failing ref becomes an auto-created Execute node ("update to
@@ -66,11 +68,14 @@ merged state as its new base (rebase-and-retry), which is what a human merge que
 **Article solution.** "Worker agents flag bloated files. Once flagged, we block new
 commits and an outside agent decomposes the overgrown file into smaller modules."
 
-**Canopy.** Two flag paths: executors return `flagged_files`, and the harness hard-scans
-line counts post-merge (`megafile_lines` threshold, default 1000). A flagged file enters
-the **block list**: any queued merge whose diff touches it is rejected and its node
-parked `Blocked`. A **Decomposer** node is created for the file (cheap model, explicit
-split instructions); when its merge lands, the block lifts and parked nodes requeue.
+**Canopy.** Two flag paths: executors return `flagged_files` (applied when the flagging
+node *lands*, so a node's own flag never gates its own merge), and the harness
+hard-scans line counts post-merge (`megafile_lines` threshold, default 1000). A flagged
+file enters the **block list**: the merge queue skips any candidate whose diff touches
+it (the node waits in `NeedsMerge`, no state churn). A **Decomposer** node is created
+for the file (cheap model, explicit split instructions); the block lifts when the
+decomposer lands — or lands empty, or permanently fails (the post-merge scan re-flags
+the file if it is still fat), so a dead decomposer can never wedge the queue forever.
 
 ## 5. Ossification → permitted breaks
 
@@ -103,7 +108,12 @@ work being audited."
 |---|---|
 | `transcript` | node spec + full agent transcript + diff |
 | `output` | node spec + diff only |
-| `codebase` | repo tree + touched files at HEAD, no history |
+| `codebase` | repo tree + touched-file list, no diff/history |
+
+All lenses run in a detached snapshot worktree pinned at the reviewed merge commit —
+the merge lane keeps landing while reviews read a frozen tree. A lens that errors or
+returns unparseable output is *counted and commented*, never treated as a clean pass;
+if every lens fails, the node is loudly flagged as effectively unreviewed.
 
 Lenses are configured with *different CLIs/models on purpose* (decorrelation across
 vendors, not just prompts). Findings come back as structured JSON with severity.

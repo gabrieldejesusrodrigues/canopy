@@ -4,3 +4,6 @@ target/
 # Added by cargo
 
 /target
+
+# OMC session state / local checkpoints
+.omc/

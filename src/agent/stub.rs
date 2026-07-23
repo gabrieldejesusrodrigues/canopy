@@ -84,9 +84,9 @@ impl AgentCli for StubCli {
             }
         }
         let raw = raw.with_context(|| {
+            let head: String = req.prompt.chars().take(200).collect();
             format!(
-                "no stub file found (tried {candidates:?}) — broken test setup\nprompt head: {}",
-                &req.prompt[..req.prompt.len().min(200)]
+                "no stub file found (tried {candidates:?}) — broken test setup\nprompt head: {head}"
             )
         })?;
 

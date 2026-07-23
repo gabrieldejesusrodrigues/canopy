@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::{params, Connection};
 
-use crate::model::{AgentRef, NewNode, Node, NodeKind, NodeState, Run};
+use crate::model::{AgentRef, NewNode, Node, NodeKind, NodeState, Role, Run};
 use crate::tracker::Tracker;
 
 // ---------------------------------------------------------------------------
@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     depth           INTEGER NOT NULL DEFAULT 0,
     attempt         INTEGER NOT NULL DEFAULT 0,
     claimed_at      TEXT,
-    updated_at      TEXT NOT NULL
+    updated_at      TEXT NOT NULL,
+    role_hint       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS comments (
@@ -72,6 +73,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
     let depends_on_json: String = row.get(8)?;
     let claimed_at_str: Option<String> = row.get(11)?;
     let updated_at_str: String = row.get(12)?;
+    let role_hint_str: Option<String> = row.get(13)?;
 
     let kind = str_to_kind(&kind_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -96,7 +98,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
 
     let agent: Option<AgentRef> = agent_json
         .as_deref()
-        .map(|j| serde_json::from_str(j))
+        .map(serde_json::from_str)
         .transpose()
         .map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -148,6 +150,22 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
             )
         })?;
 
+    let role_hint = role_hint_str
+        .as_deref()
+        .map(|s| {
+            Role::parse(s).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    13,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown role '{s}'"),
+                    )),
+                )
+            })
+        })
+        .transpose()?;
+
     Ok(Node {
         id: row.get(0)?,
         run_id: row.get(1)?,
@@ -158,6 +176,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
         spec: row.get(6)?,
         agent,
         depends_on,
+        role_hint,
         depth: row.get(9)?,
         attempt: row.get(10)?,
         claimed_at,
@@ -182,6 +201,9 @@ impl SqliteTracker {
         let conn = Connection::open(path)
             .with_context(|| format!("opening sqlite db at {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("initialising schema")?;
+        // Best-effort migration for pre-existing dev DBs created before role_hint.
+        // Errors (e.g. "duplicate column") are expected once the column exists.
+        let _ = conn.execute_batch("ALTER TABLE nodes ADD COLUMN role_hint TEXT");
         // WAL mode improves concurrent reads.
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .context("setting pragma")?;
@@ -270,15 +292,16 @@ impl Tracker for SqliteTracker {
             .as_ref()
             .map(|a| serde_json::to_string(a).unwrap());
         let depends_on_json = serde_json::to_string(&new.depends_on).unwrap();
+        let role_hint_str = new.role_hint.map(|r| r.as_str());
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, run_id, parent_id, kind, state, title, spec, agent_json, depends_on_json, depth, attempt, claimed_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, NULL, ?11)",
+            "INSERT INTO nodes (id, run_id, parent_id, kind, state, title, spec, agent_json, depends_on_json, depth, attempt, claimed_at, updated_at, role_hint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, NULL, ?11, ?12)",
             params![
                 id, new.run_id, new.parent_id, kind_str, state_str,
                 new.title, new.spec, agent_json, depends_on_json,
-                new.depth, now_s,
+                new.depth, now_s, role_hint_str,
             ],
         ).context("inserting node")?;
 
@@ -292,6 +315,7 @@ impl Tracker for SqliteTracker {
             spec: new.spec,
             agent: new.agent,
             depends_on: new.depends_on,
+            role_hint: new.role_hint,
             depth: new.depth,
             attempt: 0,
             claimed_at: None,
@@ -302,7 +326,7 @@ impl Tracker for SqliteTracker {
     async fn node(&self, id: &str) -> Result<Node> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, run_id, parent_id, kind, state, title, spec, agent_json, depends_on_json, depth, attempt, claimed_at, updated_at
+            "SELECT id, run_id, parent_id, kind, state, title, spec, agent_json, depends_on_json, depth, attempt, claimed_at, updated_at, role_hint
              FROM nodes WHERE id = ?1",
             params![id],
             row_to_node,
@@ -312,7 +336,7 @@ impl Tracker for SqliteTracker {
     async fn children(&self, parent_id: &str) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, run_id, parent_id, kind, state, title, spec, agent_json, depends_on_json, depth, attempt, claimed_at, updated_at
+            "SELECT id, run_id, parent_id, kind, state, title, spec, agent_json, depends_on_json, depth, attempt, claimed_at, updated_at, role_hint
              FROM nodes WHERE parent_id = ?1",
         )?;
         let rows = stmt.query_map(params![parent_id], row_to_node)?;
@@ -322,7 +346,7 @@ impl Tracker for SqliteTracker {
     async fn nodes_in_state(&self, run_id: &str, state: NodeState) -> Result<Vec<Node>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, run_id, parent_id, kind, state, title, spec, agent_json, depends_on_json, depth, attempt, claimed_at, updated_at
+            "SELECT id, run_id, parent_id, kind, state, title, spec, agent_json, depends_on_json, depth, attempt, claimed_at, updated_at, role_hint
              FROM nodes WHERE run_id = ?1 AND state = ?2",
         )?;
         let rows = stmt.query_map(params![run_id, state.as_str()], row_to_node)?;
@@ -341,7 +365,7 @@ impl Tracker for SqliteTracker {
             return Ok(None);
         }
         let node = conn.query_row(
-            "SELECT id, run_id, parent_id, kind, state, title, spec, agent_json, depends_on_json, depth, attempt, claimed_at, updated_at
+            "SELECT id, run_id, parent_id, kind, state, title, spec, agent_json, depends_on_json, depth, attempt, claimed_at, updated_at, role_hint
              FROM nodes WHERE id = ?1",
             params![id],
             row_to_node,
@@ -462,18 +486,44 @@ impl Tracker for SqliteTracker {
                 continue;
             }
 
-            // Check that every dependency is done.
-            let all_done = deps.iter().all(|dep_id| {
-                conn.query_row(
-                    "SELECT state FROM nodes WHERE id = ?1",
-                    params![dep_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-                .map(|s| s == "done")
-                .unwrap_or(false)
-            });
+            // Resolve each dependency's current state.
+            let dep_states: Vec<(String, String)> = deps
+                .iter()
+                .map(|dep_id| {
+                    let state = conn
+                        .query_row(
+                            "SELECT state FROM nodes WHERE id = ?1",
+                            params![dep_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap_or_default();
+                    (dep_id.clone(), state)
+                })
+                .collect();
 
+            // A dead prerequisite (failed/superseded) can never satisfy — the
+            // dependent is settled Failed so the scheduler can cascade/replan.
+            if let Some((dead_id, dead_state)) = dep_states
+                .iter()
+                .find(|(_, s)| s == "failed" || s == "superseded")
+            {
+                conn.execute(
+                    "UPDATE nodes SET state = 'failed', updated_at = ?1 WHERE id = ?2",
+                    params![now, node_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO comments (node_id, body, created_at) VALUES (?1, ?2, ?3)",
+                    params![
+                        node_id,
+                        format!("dependency {dead_id} is {dead_state}; marking this node failed"),
+                        now
+                    ],
+                )?;
+                continue;
+            }
+
+            // Otherwise, unblock only once every dependency is done.
+            let all_done = dep_states.iter().all(|(_, s)| s == "done");
             if all_done {
                 conn.execute(
                     "UPDATE nodes SET state = 'ready', updated_at = ?1 WHERE id = ?2",
@@ -494,7 +544,7 @@ impl Tracker for SqliteTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{NewNode, NodeKind, NodeState};
+    use crate::model::{NewNode, NodeKind, NodeState, Role};
     use tempfile::tempdir;
 
     fn make_tracker() -> (SqliteTracker, tempfile::TempDir) {
@@ -554,6 +604,7 @@ mod tests {
                 spec: "do A".into(),
                 agent: None,
                 depends_on: vec![],
+                role_hint: None,
                 depth: 1,
                 ready: true,
             })
@@ -570,6 +621,7 @@ mod tests {
                 spec: "do B".into(),
                 agent: None,
                 depends_on: vec![child_a.id.clone()],
+                role_hint: None,
                 depth: 1,
                 ready: false,
             })
@@ -601,5 +653,110 @@ mod tests {
         let b = t.node(&child_b.id).await.unwrap();
         assert_eq!(b.state, NodeState::Ready);
         assert!(b.claimed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn role_hint_roundtrips() {
+        let (t, _dir) = make_tracker();
+        let run = t.init_run("obj", "canopy/run-rh").await.unwrap();
+
+        let node = t
+            .create_node(NewNode {
+                run_id: run.id.clone(),
+                parent_id: Some(run.root_node.clone()),
+                kind: NodeKind::Plan,
+                title: "decomposer".into(),
+                spec: "split".into(),
+                agent: None,
+                depends_on: vec![],
+                role_hint: Some(Role::Decomposer),
+                depth: 1,
+                ready: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(node.role_hint, Some(Role::Decomposer));
+
+        // Reload from the board to prove the column persisted.
+        let reloaded = t.node(&node.id).await.unwrap();
+        assert_eq!(reloaded.role_hint, Some(Role::Decomposer));
+    }
+
+    #[tokio::test]
+    async fn unblock_satisfied_both_ways() {
+        let (t, _dir) = make_tracker();
+        let run = t.init_run("obj", "canopy/run-ub").await.unwrap();
+        let root = t.node(&run.root_node).await.unwrap();
+
+        let new_dep = |title: &str| NewNode {
+            run_id: run.id.clone(),
+            parent_id: Some(root.id.clone()),
+            kind: NodeKind::Execute,
+            title: title.into(),
+            spec: "x".into(),
+            agent: None,
+            depends_on: vec![],
+            role_hint: None,
+            depth: 1,
+            ready: true,
+        };
+
+        // Two independent dependencies, each with a dependent blocked on it.
+        let dep_ok = t.create_node(new_dep("dep-ok")).await.unwrap();
+        let dep_bad = t.create_node(new_dep("dep-bad")).await.unwrap();
+
+        let blocked = |dep_id: String, title: &str| NewNode {
+            run_id: run.id.clone(),
+            parent_id: Some(root.id.clone()),
+            kind: NodeKind::Execute,
+            title: title.into(),
+            spec: "x".into(),
+            agent: None,
+            depends_on: vec![dep_id],
+            role_hint: None,
+            depth: 1,
+            ready: false,
+        };
+        let dependent_ok = t
+            .create_node(blocked(dep_ok.id.clone(), "dependent-ok"))
+            .await
+            .unwrap();
+        let dependent_bad = t
+            .create_node(blocked(dep_bad.id.clone(), "dependent-bad"))
+            .await
+            .unwrap();
+        assert_eq!(dependent_ok.state, NodeState::Blocked);
+        assert_eq!(dependent_bad.state, NodeState::Blocked);
+
+        // dep done -> dependent becomes ready; dep failed -> dependent becomes failed.
+        t.set_state(&dep_ok.id, NodeState::Done).await.unwrap();
+        t.set_state(&dep_bad.id, NodeState::Failed).await.unwrap();
+
+        let moved = t.unblock_satisfied(&run.id).await.unwrap();
+        assert_eq!(moved, 1, "only the done-dep dependent counts as unblocked");
+
+        assert_eq!(
+            t.node(&dependent_ok.id).await.unwrap().state,
+            NodeState::Ready
+        );
+        assert_eq!(
+            t.node(&dependent_bad.id).await.unwrap().state,
+            NodeState::Failed
+        );
+
+        // A superseded dependency settles the dependent Failed too.
+        let dep_sup = t.create_node(new_dep("dep-sup")).await.unwrap();
+        let dependent_sup = t
+            .create_node(blocked(dep_sup.id.clone(), "dependent-sup"))
+            .await
+            .unwrap();
+        t.set_state(&dep_sup.id, NodeState::Superseded)
+            .await
+            .unwrap();
+        t.unblock_satisfied(&run.id).await.unwrap();
+        assert_eq!(
+            t.node(&dependent_sup.id).await.unwrap().state,
+            NodeState::Failed
+        );
     }
 }

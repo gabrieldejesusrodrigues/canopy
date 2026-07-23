@@ -9,7 +9,7 @@ use tokio::time;
 
 use crate::model::CliKind;
 
-use super::{AgentCli, InvocationRequest, InvocationResult, Usage};
+use super::{proc, AgentCli, InvocationRequest, InvocationResult, Usage};
 
 pub struct CodexCli;
 
@@ -44,6 +44,9 @@ pub struct ParsedEvents {
     pub final_message: Option<String>,
     pub usage: Usage,
     pub exit_ok: bool,
+    /// Reasoning tokens seen on turn.completed. Not folded into output_tokens
+    /// (double-count risk); noted in the transcript only.
+    pub reasoning_tokens: u64,
 }
 
 /// Parse a JSONL transcript from codex. Separated for unit-testability.
@@ -51,6 +54,8 @@ pub fn parse_events(jsonl: &str) -> ParsedEvents {
     let mut usage = Usage::default();
     let mut last_agent_message: Option<String> = None;
     let mut had_failure = false;
+    let mut turn_completed = false;
+    let mut reasoning_tokens = 0u64;
 
     for line in jsonl.lines() {
         let line = line.trim();
@@ -62,11 +67,12 @@ pub fn parse_events(jsonl: &str) -> ParsedEvents {
         };
         match ev.kind.as_str() {
             "turn.completed" => {
+                turn_completed = true;
                 if let Some(u) = ev.usage {
                     usage.input_tokens = u.input_tokens.unwrap_or(0);
                     usage.cached_tokens = u.cached_input_tokens.unwrap_or(0);
-                    usage.output_tokens =
-                        u.output_tokens.unwrap_or(0) + u.reasoning_output_tokens.unwrap_or(0);
+                    usage.output_tokens = u.output_tokens.unwrap_or(0);
+                    reasoning_tokens = u.reasoning_output_tokens.unwrap_or(0);
                 }
             }
             "turn.failed" | "error" => {
@@ -85,10 +91,20 @@ pub fn parse_events(jsonl: &str) -> ParsedEvents {
         }
     }
 
+    // A completed turn requires the turn.completed event AND either a final
+    // message or no failure signal. An empty/malformed stream (no completed
+    // turn, no message) is not success even on exit 0.
+    let has_message = last_agent_message
+        .as_deref()
+        .map(|m| !m.trim().is_empty())
+        .unwrap_or(false);
+    let exit_ok = !had_failure && turn_completed && has_message;
+
     ParsedEvents {
         final_message: last_agent_message,
         usage,
-        exit_ok: !had_failure,
+        exit_ok,
+        reasoning_tokens,
     }
 }
 
@@ -103,6 +119,9 @@ impl AgentCli for CodexCli {
 
         // last_msg_file = transcript_path with extension replaced by "last.txt"
         let last_msg_file = req.transcript_path.with_extension("last.txt");
+        // Delete any stale -o file so a nudge retry doesn't read the previous
+        // invocation's last message.
+        let _ = tokio::fs::remove_file(&last_msg_file).await;
 
         let mut cmd = Command::new("codex");
         cmd.arg("exec")
@@ -123,8 +142,10 @@ impl AgentCli for CodexCli {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        proc::own_group(&mut cmd);
 
         let child = cmd.spawn().context("failed to spawn codex")?;
+        let pid = child.id();
 
         let result = time::timeout(
             std::time::Duration::from_secs(req.timeout_secs),
@@ -135,7 +156,13 @@ impl AgentCli for CodexCli {
         let output = match result {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => bail!("codex process error: {e}"),
-            Err(_) => bail!("codex timed out after {} seconds", req.timeout_secs),
+            Err(_) => {
+                // Timeout — kill the whole process group (codex spawns children).
+                if let Some(pid) = pid {
+                    proc::kill_group(pid).await;
+                }
+                bail!("codex timed out after {} seconds", req.timeout_secs)
+            }
         };
 
         let duration_ms = start.elapsed().as_millis();
@@ -148,7 +175,15 @@ impl AgentCli for CodexCli {
             chars[start_idx..].iter().collect()
         };
 
-        // Write JSONL transcript
+        let ParsedEvents {
+            final_message: events_msg,
+            usage,
+            exit_ok: events_ok,
+            reasoning_tokens,
+        } = parse_events(stdout.trim());
+
+        // Write JSONL transcript, plus a trailing note of reasoning tokens
+        // (kept out of output_tokens to avoid double-counting).
         {
             let mut f = tokio::fs::File::create(&req.transcript_path)
                 .await
@@ -159,13 +194,13 @@ impl AgentCli for CodexCli {
                     )
                 })?;
             f.write_all(output.stdout.as_ref()).await?;
+            if reasoning_tokens > 0 {
+                f.write_all(
+                    format!("\n# reasoning_output_tokens={reasoning_tokens}\n").as_bytes(),
+                )
+                .await?;
+            }
         }
-
-        let ParsedEvents {
-            final_message: events_msg,
-            usage,
-            exit_ok: events_ok,
-        } = parse_events(stdout.trim());
 
         // Prefer -o file; fall back to last item.completed agent_message
         let final_message = match tokio::fs::read_to_string(&last_msg_file).await {
@@ -221,8 +256,9 @@ mod tests {
         assert!(parsed.exit_ok);
         assert_eq!(parsed.usage.input_tokens, 1200);
         assert_eq!(parsed.usage.cached_tokens, 300);
-        // output = 450 + 50 reasoning
-        assert_eq!(parsed.usage.output_tokens, 500);
+        // output = 450; reasoning (50) is tracked separately, not folded in
+        assert_eq!(parsed.usage.output_tokens, 450);
+        assert_eq!(parsed.reasoning_tokens, 50);
         assert!(parsed.usage.cost_usd.is_none());
     }
 
@@ -239,10 +275,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_jsonl() {
+    fn parse_empty_jsonl_is_not_success() {
+        // No turn.completed and no final message → not a completed turn,
+        // even though there is no explicit failure event.
         let parsed = parse_events("");
         assert!(parsed.final_message.is_none());
-        assert!(parsed.exit_ok); // no failure event = ok
+        assert!(!parsed.exit_ok);
         assert_eq!(parsed.usage.input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_completed_turn_without_message_is_not_success() {
+        let jsonl = r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}"#;
+        let parsed = parse_events(jsonl);
+        assert!(!parsed.exit_ok);
+    }
+
+    #[test]
+    fn parse_message_without_completed_turn_is_not_success() {
+        let jsonl = r#"{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}"#;
+        let parsed = parse_events(jsonl);
+        assert_eq!(parsed.final_message.as_deref(), Some("hi"));
+        assert!(!parsed.exit_ok);
     }
 }

@@ -4,13 +4,12 @@ use anyhow::{bail, Context};
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time;
 
 use crate::model::CliKind;
 
-use super::{AgentCli, InvocationRequest, InvocationResult, Usage};
+use super::{proc, AgentCli, InvocationRequest, InvocationResult, Usage};
 
 pub struct ClaudeCli;
 
@@ -60,11 +59,6 @@ pub fn parse_output(stdout: &str) -> anyhow::Result<(String, Usage, bool)> {
     Ok((final_message, usage, !is_error))
 }
 
-async fn kill_child(mut child: Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
 #[async_trait]
 impl AgentCli for ClaudeCli {
     fn kind(&self) -> CliKind {
@@ -95,8 +89,10 @@ impl AgentCli for ClaudeCli {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        proc::own_group(&mut cmd);
 
         let child = cmd.spawn().context("failed to spawn claude")?;
+        let pid = child.id();
 
         let result = time::timeout(
             std::time::Duration::from_secs(req.timeout_secs),
@@ -108,7 +104,10 @@ impl AgentCli for ClaudeCli {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => bail!("claude process error: {e}"),
             Err(_) => {
-                // Timeout — child is dropped (kill_on_drop), but be explicit
+                // Timeout — kill the whole process group (claude spawns children).
+                if let Some(pid) = pid {
+                    proc::kill_group(pid).await;
+                }
                 bail!("claude timed out after {} seconds", req.timeout_secs);
             }
         };

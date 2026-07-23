@@ -129,16 +129,19 @@ pub fn reviewer(
     spec: &str,
     diff: &str,
     transcript: Option<&str>,
+    touched_files: &[String],
 ) -> String {
     let contract = match lens {
         Lens::Transcript => REVIEWER_TRANSCRIPT,
         Lens::Output => REVIEWER_OUTPUT,
         Lens::Codebase => REVIEWER_CODEBASE,
     };
+    let files = touched_files.join("\n");
     let sections: Vec<(&str, &str)> = match lens {
         // Codebase lens deliberately sees no diff/history — only the repo it
-        // sits in (its worktree) and what unit was requested.
-        Lens::Codebase => vec![("WORK UNIT", spec)],
+        // sits in (its worktree), what unit was requested, and which files
+        // that unit touched (so it knows where to look).
+        Lens::Codebase => vec![("WORK UNIT", spec), ("FILES", &files)],
         Lens::Output => vec![("WORK UNIT", spec), ("DIFF", diff)],
         Lens::Transcript => vec![
             ("WORK UNIT", spec),

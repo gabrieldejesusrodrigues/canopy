@@ -65,11 +65,57 @@ pub fn for_ref(agent: &AgentRef) -> Box<dyn AgentCli> {
 
 /// Extract the trailing fenced ```json block from an agent's final message.
 /// Contracts require it; parse failures trigger one retry with a nudge.
+///
+/// After the last ```json opener, try every subsequent closing fence in order
+/// and return the first slice that parses as JSON — otherwise valid JSON whose
+/// string content embeds ``` (e.g. a planner child spec with a code fence)
+/// would be truncated at the wrong fence. Falls back to the first fence.
 pub fn trailing_json(message: &str) -> Option<&str> {
     let open = message.rfind("```json")?;
     let after = &message[open + 7..];
-    let close = after.find("```")?;
-    Some(after[..close].trim())
+
+    let mut first_fence: Option<&str> = None;
+    let mut search_from = 0;
+    while let Some(rel) = after[search_from..].find("```") {
+        let close = search_from + rel;
+        let slice = after[..close].trim();
+        if first_fence.is_none() {
+            first_fence = Some(slice);
+        }
+        if serde_json::from_str::<serde_json::Value>(slice).is_ok() {
+            return Some(slice);
+        }
+        search_from = close + 3;
+    }
+
+    first_fence
+}
+
+#[cfg(unix)]
+pub(crate) mod proc {
+    use tokio::process::Command;
+
+    /// Put the child in its own process group so a timeout can kill the whole
+    /// tree (claude/codex/agy spawn children), not just the direct process.
+    /// pgid == child pid because of process_group(0).
+    pub fn own_group(cmd: &mut Command) {
+        cmd.process_group(0);
+    }
+
+    /// Kill the process group by pid. Shells out to `kill` to avoid a libc dep.
+    pub async fn kill_group(pid: u32) {
+        let _ = Command::new("kill")
+            .args(["-9", &format!("-{pid}")])
+            .status()
+            .await;
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) mod proc {
+    use tokio::process::Command;
+    pub fn own_group(_cmd: &mut Command) {}
+    pub async fn kill_group(_pid: u32) {}
 }
 
 #[cfg(test)]
@@ -81,5 +127,21 @@ mod tests {
         let msg = "prose\n```json\n{\"a\":1}\n```\nmore\n```json\n{\"b\":2}\n```\n";
         assert_eq!(trailing_json(msg), Some("{\"b\":2}"));
         assert_eq!(trailing_json("no block"), None);
+    }
+
+    #[test]
+    fn json_string_value_may_contain_triple_backticks() {
+        // The JSON string embeds a ``` fence; the naive first-fence cut would
+        // truncate at it and fail to parse. We must find the real closing fence.
+        let msg = "```json\n{\"spec\":\"run ```rust\\nfn main(){}\\n``` now\"}\n```\n";
+        let got = trailing_json(msg).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(got).is_ok());
+        assert!(got.contains("```rust"));
+    }
+
+    #[test]
+    fn falls_back_to_first_fence_when_nothing_parses() {
+        let msg = "```json\nnot valid json ``` still not\n```\n";
+        assert_eq!(trailing_json(msg), Some("not valid json"));
     }
 }

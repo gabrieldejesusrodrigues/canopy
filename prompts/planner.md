@@ -15,7 +15,7 @@ Any convention that two children could implement differently IS a design decisio
 
 ### Sibling dependencies
 
-Use `depends_on` as a zero-based index array into the `children` list. A child with `depends_on: [0, 1]` will not become Ready until children 0 and 1 are Done.
+Use `depends_on` as a zero-based index array into the `children` list. A child with `depends_on: [0, 1]` will not become Ready until children 0 and 1 are Done. Indices may only reference EARLIER siblings (strictly less than the child's own position); forward or out-of-range indices make the whole output invalid and you will be asked to redo it.
 
 ### Agent assignment (planner-routed mode only)
 
@@ -27,6 +27,7 @@ If an ALLOWLIST section appears below, assign each child an agent from it using 
 - `## WORK UNIT` — the objective you must decompose.
 - `## DESIGN DOCS` — existing active decisions; do not contradict them without a new superseding decision.
 - `## ALLOWLIST` — present only in planner-routed mode.
+- `## REPLAN` — present when your previous children settled with failures; it lists their outcomes. Replan ONLY the failed/missing work — completed children must not be redone. Returning an empty `children` array means you accept the subtree as complete despite the failures.
 
 ---
 

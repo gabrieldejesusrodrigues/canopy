@@ -69,6 +69,8 @@ impl GitOps {
     }
 
     /// Create the run branch (from current HEAD if new) and its merge worktree.
+    /// An existing merge worktree may be left over from a previous run: clear
+    /// any in-progress merge (crash recovery) and re-point it at this branch.
     pub async fn ensure_run_branch(&self, branch: &str) -> Result<()> {
         let exists = self
             .git(&["rev-parse", "--verify", "--quiet", branch])
@@ -82,8 +84,74 @@ impl GitOps {
             std::fs::create_dir_all(md.parent().unwrap())?;
             self.git(&["worktree", "add", md.to_str().unwrap(), branch])
                 .await?;
+        } else {
+            self.abort_merge().await?;
+            let head = self
+                .git_in(&md, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .await?;
+            if head.trim() != branch {
+                self.git_in(&md, &["checkout", branch]).await?;
+            }
         }
         Ok(())
+    }
+
+    pub fn snapshot_dir(&self, tag: &str) -> PathBuf {
+        self.state.join("snapshots").join(tag)
+    }
+
+    /// Read-only detached checkout for planner/reviewer/reconciler processes,
+    /// so agent reads never race the merge lane's own checkout.
+    pub async fn create_snapshot(&self, tag: &str, commitish: &str) -> Result<PathBuf> {
+        let path = self.snapshot_dir(tag);
+        if path.exists() {
+            self.remove_snapshot(tag).await?;
+        }
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        self.git(&[
+            "worktree",
+            "add",
+            "--detach",
+            path.to_str().unwrap(),
+            commitish,
+        ])
+        .await?;
+        Ok(path)
+    }
+
+    pub async fn remove_snapshot(&self, tag: &str) -> Result<()> {
+        let path = self.snapshot_dir(tag);
+        if path.exists() {
+            self.git(&["worktree", "remove", "--force", path.to_str().unwrap()])
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Last N commit subjects on the run branch (Merger context: what the
+    /// "other side" of the serialized queue has been landing).
+    pub async fn recent_subjects(&self, n: usize) -> Result<String> {
+        let n = n.to_string();
+        self.git_in(&self.merge_dir(), &["log", "-n", &n, "--format=%s"])
+            .await
+    }
+
+    /// Files touched by one merge commit (review lens context).
+    pub async fn commit_files(&self, commit: &str) -> Result<Vec<String>> {
+        let out = self
+            .git_in(
+                &self.merge_dir(),
+                &[
+                    "show",
+                    "--format=",
+                    "--name-only",
+                    "-m",
+                    "--first-parent",
+                    commit,
+                ],
+            )
+            .await?;
+        Ok(out.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect())
     }
 
     /// Fresh worktree for a node, branched off the current run branch tip.

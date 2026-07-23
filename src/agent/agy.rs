@@ -8,7 +8,7 @@ use tokio::time;
 
 use crate::model::CliKind;
 
-use super::{AgentCli, InvocationRequest, InvocationResult, Usage};
+use super::{proc, AgentCli, InvocationRequest, InvocationResult, Usage};
 
 pub struct AgyCli;
 
@@ -39,8 +39,10 @@ impl AgentCli for AgyCli {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        proc::own_group(&mut cmd);
 
         let child = cmd.spawn().context("failed to spawn agy")?;
+        let pid = child.id();
 
         let result = time::timeout(
             std::time::Duration::from_secs(req.timeout_secs),
@@ -51,7 +53,13 @@ impl AgentCli for AgyCli {
         let output = match result {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => bail!("agy process error: {e}"),
-            Err(_) => bail!("agy timed out after {} seconds", req.timeout_secs),
+            Err(_) => {
+                // Timeout — kill the whole process group (agy spawns children).
+                if let Some(pid) = pid {
+                    proc::kill_group(pid).await;
+                }
+                bail!("agy timed out after {} seconds", req.timeout_secs);
+            }
         };
 
         let duration_ms = start.elapsed().as_millis();

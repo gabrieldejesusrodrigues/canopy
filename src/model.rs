@@ -31,6 +31,9 @@ pub enum NodeState {
     Blocked,
     Done,
     Failed,
+    /// Terminal-settled: replaced during a replan. Not a failure — it no
+    /// longer counts against its parent, but it is never retried either.
+    Superseded,
 }
 
 impl NodeState {
@@ -45,6 +48,7 @@ impl NodeState {
             NodeState::Blocked => "blocked",
             NodeState::Done => "done",
             NodeState::Failed => "failed",
+            NodeState::Superseded => "superseded",
         }
     }
 
@@ -59,6 +63,7 @@ impl NodeState {
             "blocked" => NodeState::Blocked,
             "done" => NodeState::Done,
             "failed" => NodeState::Failed,
+            "superseded" => NodeState::Superseded,
             _ => return None,
         })
     }
@@ -116,6 +121,18 @@ impl Role {
             Role::Reviewer => "reviewer",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Role> {
+        Some(match s {
+            "planner" => Role::Planner,
+            "executor" => Role::Executor,
+            "merger" => Role::Merger,
+            "reconciler" => Role::Reconciler,
+            "decomposer" => Role::Decomposer,
+            "reviewer" => Role::Reviewer,
+            _ => return None,
+        })
+    }
 }
 
 /// Review lens: what context the reviewer sees (uncorrelated views sum).
@@ -168,6 +185,8 @@ pub struct Node {
     pub agent: Option<AgentRef>,
     /// Node ids that must be Done before this becomes Ready.
     pub depends_on: Vec<String>,
+    /// Mechanism role override (e.g. Decomposer); None = derived from kind.
+    pub role_hint: Option<Role>,
     pub depth: u32,
     pub attempt: u32,
     pub claimed_at: Option<DateTime<Utc>>,
@@ -184,6 +203,8 @@ pub struct NewNode {
     pub spec: String,
     pub agent: Option<AgentRef>,
     pub depends_on: Vec<String>,
+    /// Mechanism role override (e.g. Decomposer); None = derived from kind.
+    pub role_hint: Option<Role>,
     pub depth: u32,
     /// If false, node starts Blocked (waiting on depends_on).
     pub ready: bool,

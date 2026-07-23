@@ -8,7 +8,7 @@
 //! lane is a task too, but at most one is ever in flight — that lane IS the
 //! article's "single point every change passes through".
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -38,10 +38,21 @@ pub struct Scheduler {
     inflight_plan: usize,
     inflight_exec: usize,
     merge_inflight: bool,
+    /// Node ids with a live tree job in THIS process. A lease can expire
+    /// under a long nudge retry; this set stops the claim path from yanking
+    /// the worktree out from under the still-running agent.
+    inflight: HashSet<String>,
     /// node → pending review lenses + findings so far.
     reviews: HashMap<String, ReviewAgg>,
     /// node → context injected on retry (verify failures, bounces).
     retry_ctx: HashMap<String, String>,
+    /// Executor-reported megafile flags, applied when the node LANDS — its
+    /// own flag must not gate its own merge, and the decomposer must split
+    /// the file with this node's changes already in.
+    pending_flags: HashMap<String, Vec<String>>,
+    /// Declared breaks (mechanism 5): verify failure lands + propagates as
+    /// fix nodes instead of bouncing.
+    declared_breaks: HashMap<String, Vec<BreakNote>>,
     /// planner node → replans consumed.
     replans: HashMap<String, u32>,
     paused_for_budget: bool,
@@ -64,6 +75,8 @@ enum Deferred {
 struct ReviewAgg {
     pending: usize,
     findings: Vec<Finding>,
+    /// Lenses that errored or returned unparseable output — never "clean".
+    failed: usize,
 }
 
 enum JobOut {
@@ -110,6 +123,9 @@ enum MergeReport {
     Landed {
         commit: String,
         megafiles: Vec<String>,
+        /// Verify failed but the node declared breaks: land anyway, the
+        /// failure tail becomes fix work (mechanism 5's "compiler").
+        verify_debt: Option<String>,
     },
     Error(String),
 }
@@ -121,6 +137,22 @@ impl Scheduler {
         resume: Option<String>,
     ) -> Result<()> {
         let cfg = Arc::new(cfg);
+        // One daemon per repo: the merge worktree and blocklist assume a
+        // single writer. Stale locks (dead pid) are reclaimed.
+        std::fs::create_dir_all(cfg.state_dir())?;
+        let lock_path = cfg.state_dir().join("daemon.pid");
+        if let Ok(prev) = std::fs::read_to_string(&lock_path) {
+            let prev = prev.trim().to_owned();
+            if !prev.is_empty() && std::path::Path::new(&format!("/proc/{prev}")).exists() {
+                anyhow::bail!(
+                    "another canopy daemon (pid {prev}) already runs on this repo — \
+                     refusing a second writer ({})",
+                    lock_path.display()
+                );
+            }
+        }
+        std::fs::write(&lock_path, std::process::id().to_string())?;
+
         let tracker = crate::tracker::from_config(&cfg).await?;
         let git = GitOps::new(&cfg.run.repo);
         let ledger = Ledger::open(&cfg.state_dir().join("ledger.db"))?;
@@ -137,6 +169,17 @@ impl Scheduler {
         git.ensure_run_branch(&run.branch).await?;
         if fieldguide::ensure_scaffold(&git.merge_dir())? {
             git.harness_commit("canopy: scaffold design/ and fieldguide/")
+                .await?;
+        }
+        // Crash recovery: a merge in flight when the daemon died left its
+        // node Merging (ensure_run_branch already cleared the worktree side).
+        for n in tracker
+            .nodes_in_state(&run.id, NodeState::Merging)
+            .await?
+        {
+            tracker.set_state(&n.id, NodeState::NeedsMerge).await?;
+            tracker
+                .comment(&n.id, "recovered from interrupted merge — requeued")
                 .await?;
         }
         let blocklist = BlockList::load(&cfg.state_dir())?;
@@ -160,19 +203,25 @@ impl Scheduler {
             inflight_plan: 0,
             inflight_exec: 0,
             merge_inflight: false,
+            inflight: HashSet::new(),
             reviews: HashMap::new(),
             retry_ctx: HashMap::new(),
+            pending_flags: HashMap::new(),
+            declared_breaks: HashMap::new(),
             replans: HashMap::new(),
             paused_for_budget: false,
             pending: Vec::new(),
         };
         sched.recover_in_review().await?;
-        sched.run_loop().await
+        let result = sched.run_loop().await;
+        let _ = std::fs::remove_file(&lock_path);
+        result
     }
 
     async fn run_loop(&mut self) -> Result<()> {
         loop {
             self.settle().await?;
+            self.sweep_cascades().await?;
             self.pump_deferred().await?;
             self.pump_merges().await?;
             self.pump_reviews().await?;
@@ -268,7 +317,7 @@ impl Scheduler {
     // ------------------------------------------------------------------
 
     async fn pump_merges(&mut self) -> Result<()> {
-        if self.merge_inflight {
+        if self.merge_inflight || self.paused_for_budget {
             return Ok(());
         }
         let mut queue = self
@@ -276,31 +325,50 @@ impl Scheduler {
             .nodes_in_state(&self.run.id, NodeState::NeedsMerge)
             .await?;
         queue.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
-        let Some(node) = queue.into_iter().next() else {
-            return Ok(());
-        };
-        if !self
-            .tracker
-            .transition(&node.id, NodeState::NeedsMerge, NodeState::Merging)
-            .await?
-        {
+        for node in queue {
+            // Candidates touching a blocked megafile wait in NeedsMerge with
+            // no state churn; the next candidate gets the lane (mechanism 4).
+            let files = self
+                .git
+                .changed_files(&node.id, &self.run.branch)
+                .await
+                .unwrap_or_default();
+            if let Some(f) = self.blocklist.gate(&files, &node.id) {
+                tracing::debug!(node = node.id, file = f, "merge candidate gated — skipped");
+                continue;
+            }
+            if !self
+                .tracker
+                .transition(&node.id, NodeState::NeedsMerge, NodeState::Merging)
+                .await?
+            {
+                continue;
+            }
+            self.merge_inflight = true;
+            let cfg = self.cfg.clone();
+            let run_branch = self.run.branch.clone();
+            let breaks = self
+                .declared_breaks
+                .get(&node.id)
+                .cloned()
+                .unwrap_or_default();
+            self.jobs.spawn(async move {
+                let (report, merger_runs) = merge_job(cfg, node.clone(), run_branch, breaks).await;
+                JobOut::Merge {
+                    node,
+                    report,
+                    merger_runs,
+                }
+            });
             return Ok(());
         }
-        self.merge_inflight = true;
-        let cfg = self.cfg.clone();
-        let run_branch = self.run.branch.clone();
-        self.jobs.spawn(async move {
-            let (report, merger_runs) = merge_job(cfg, node.clone(), run_branch).await;
-            JobOut::Merge {
-                node,
-                report,
-                merger_runs,
-            }
-        });
         Ok(())
     }
 
     async fn pump_reviews(&mut self) -> Result<()> {
+        if self.paused_for_budget {
+            return Ok(());
+        }
         // Nodes sitting InReview with no aggregation entry (fresh merge or
         // post-crash recovery) get their lenses scheduled here.
         let nodes = self
@@ -323,6 +391,7 @@ impl Scheduler {
                 continue;
             };
             let diff = self.git.merge_diff(&commit).await.unwrap_or_default();
+            let touched = self.git.commit_files(&commit).await.unwrap_or_default();
             let fg = fieldguide::index_content(&self.git.merge_dir());
             let transcript = std::fs::read_to_string(
                 self.cfg
@@ -331,11 +400,28 @@ impl Scheduler {
                     .join(format!("{}-{}.txt", node.id, node.attempt)),
             )
             .ok();
+            // Reviewers read a snapshot pinned at the merge commit: the merge
+            // lane keeps moving and must never move the tree under a lens.
+            let snap = match self
+                .git
+                .create_snapshot(&format!("review-{}", node.id), &commit)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    self.tracker
+                        .comment(&node.id, &format!("review skipped: snapshot failed: {e:#}"))
+                        .await?;
+                    self.finish_review(node, Vec::new()).await?;
+                    continue;
+                }
+            };
             self.reviews.insert(
                 node.id.clone(),
                 ReviewAgg {
                     pending: self.cfg.routing.reviewers.len(),
                     findings: Vec::new(),
+                    failed: 0,
                 },
             );
             for rc in &self.cfg.routing.reviewers {
@@ -343,8 +429,24 @@ impl Scheduler {
                     cli: rc.cli,
                     model: rc.model.clone(),
                 };
-                let p = prompt::reviewer(&fg, rc.lens, &node.spec, &diff, transcript.as_deref());
-                let req = self.request(&node, Role::Reviewer, &agent_ref, p, self.git.merge_dir());
+                let p = prompt::reviewer(
+                    &fg,
+                    rc.lens,
+                    &node.spec,
+                    &diff,
+                    transcript.as_deref(),
+                    &touched,
+                );
+                let mut req =
+                    self.request(&node, Role::Reviewer, &agent_ref, p, snap.clone());
+                // Lens-suffixed transcripts: concurrent lenses must not share
+                // a file (and must never clobber the executor's transcript).
+                req.transcript_path = self.cfg.state_dir().join("transcripts").join(format!(
+                    "{}-{}-review-{}.txt",
+                    node.id,
+                    node.attempt,
+                    rc.lens.as_str()
+                ));
                 let node_c = node.clone();
                 let lens = rc.lens;
                 let ar = agent_ref.clone();
@@ -377,6 +479,11 @@ impl Scheduler {
         // Deepest first: finish subtrees before opening new ones.
         ready.sort_by(|a, b| b.depth.cmp(&a.depth));
         for node in ready {
+            if self.inflight.contains(&node.id) {
+                // A live job (e.g. a nudge retry) outlived its lease: never
+                // re-claim under it — its worktree is in use.
+                continue;
+            }
             let cap_ok = match node.kind {
                 NodeKind::Plan => self.inflight_plan < self.cfg.budgets.max_parallel_planners,
                 NodeKind::Execute => self.inflight_exec < self.cfg.budgets.max_parallel,
@@ -403,8 +510,13 @@ impl Scheduler {
                 let allow = (self.cfg.routing.mode == RoutingMode::PlannerRouted)
                     .then_some(self.cfg.routing.allowlist.as_slice());
                 let p = prompt::planner(&fg, &node.spec, &all_docs, allow, retry.as_deref());
-                // Planners read the run branch state, never a private worktree.
-                (p, self.git.merge_dir())
+                // Planners read a snapshot of the run branch pinned at spawn
+                // time — never the merge lane's own (moving) checkout.
+                let wt = self
+                    .git
+                    .create_snapshot(&format!("plan-{}", node.id), &self.run.branch)
+                    .await?;
+                (p, wt)
             }
             NodeKind::Execute => {
                 let docs: Vec<_> = all_docs
@@ -412,7 +524,11 @@ impl Scheduler {
                     .filter(|d| node.spec.contains(&d.meta.id))
                     .cloned()
                     .collect();
-                let p = prompt::executor(&fg, &node.spec, &docs, retry.as_deref());
+                let p = if node.role_hint == Some(Role::Decomposer) {
+                    prompt::decomposer(&fg, &node.spec, &docs)
+                } else {
+                    prompt::executor(&fg, &node.spec, &docs, retry.as_deref())
+                };
                 let wt = self.git.create_worktree(&node.id, &self.run.branch).await?;
                 (p, wt)
             }
@@ -421,10 +537,8 @@ impl Scheduler {
             NodeKind::Plan => self.inflight_plan += 1,
             NodeKind::Execute => self.inflight_exec += 1,
         }
-        let role = match node.kind {
-            NodeKind::Plan => Role::Planner,
-            NodeKind::Execute => Role::Executor,
-        };
+        self.inflight.insert(node.id.clone());
+        let role = node_role(&node);
         let req = self.request(&node, role, &agent_ref, prompt_used.clone(), workdir);
         let ar = agent_ref.clone();
         let node_c = node.clone();
@@ -503,6 +617,8 @@ impl Scheduler {
                     NodeKind::Plan => self.inflight_plan = self.inflight_plan.saturating_sub(1),
                     NodeKind::Execute => self.inflight_exec = self.inflight_exec.saturating_sub(1),
                 }
+                // A nudge respawn re-inserts; otherwise the node is free.
+                self.inflight.remove(&node.id);
                 self.apply_tree(node, agent_ref, prompt_used, res, is_retry_nudge)
                     .await
             }
@@ -610,16 +726,39 @@ impl Scheduler {
         let json = agent::trailing_json(&inv.final_message);
         match node.kind {
             NodeKind::Plan => {
-                let parsed = json.and_then(|j| serde_json::from_str::<PlannerOutput>(j).ok());
+                let parsed = json
+                    .and_then(|j| serde_json::from_str::<PlannerOutput>(j).ok())
+                    // depends_on must reference earlier siblings only; a
+                    // forward/out-of-range index silently dropped would run a
+                    // child before its declared prerequisite.
+                    .filter(|out| {
+                        out.children
+                            .iter()
+                            .enumerate()
+                            .all(|(i, c)| c.depends_on.iter().all(|ix| *ix < i))
+                    });
                 match parsed {
                     Some(out) if self.merge_inflight => {
+                        self.git
+                            .remove_snapshot(&format!("plan-{}", node.id))
+                            .await
+                            .ok();
                         // Design-doc writes must wait for the merge lane.
                         self.pending.push(Deferred::Plan(node, out));
                         Ok(())
                     }
-                    Some(out) => self.apply_planner_output(node, out).await,
+                    Some(out) => {
+                        self.git
+                            .remove_snapshot(&format!("plan-{}", node.id))
+                            .await
+                            .ok();
+                        self.apply_planner_output(node, out).await
+                    }
                     None if !was_nudged => {
-                        let nudged = prompt::json_retry_nudge(&prompt_used, "missing or invalid");
+                        let nudged = prompt::json_retry_nudge(
+                            &prompt_used,
+                            "missing, invalid, or depends_on referencing a non-earlier sibling",
+                        );
                         self.respawn_with_prompt(node, agent_ref, nudged).await
                     }
                     None => {
@@ -656,8 +795,9 @@ impl Scheduler {
             NodeKind::Plan => self.inflight_plan += 1,
             NodeKind::Execute => self.inflight_exec += 1,
         }
+        self.inflight.insert(node.id.clone());
         let workdir = match node.kind {
-            NodeKind::Plan => self.git.merge_dir(),
+            NodeKind::Plan => self.git.snapshot_dir(&format!("plan-{}", node.id)),
             NodeKind::Execute => self.git.worktree_dir(&node.id),
         };
         let role = node_role(&node);
@@ -677,6 +817,12 @@ impl Scheduler {
     }
 
     async fn fail_attempt(&mut self, node: Node, reason: &str) -> Result<()> {
+        if node.kind == NodeKind::Plan {
+            self.git
+                .remove_snapshot(&format!("plan-{}", node.id))
+                .await
+                .ok();
+        }
         let attempt = self.tracker.bump_attempt(&node.id).await?;
         self.tracker.comment(&node.id, reason).await?;
         if attempt < self.cfg.budgets.max_attempts {
@@ -684,6 +830,19 @@ impl Scheduler {
                 .insert(node.id.clone(), reason.chars().take(2000).collect());
             self.tracker.set_state(&node.id, NodeState::Ready).await?;
         } else {
+            self.pending_flags.remove(&node.id);
+            self.declared_breaks.remove(&node.id);
+            // A dead decomposer must not leave its file blocked forever;
+            // the post-merge scan re-flags it if it is still fat.
+            let lifted = self.blocklist.lift_for_node(&node.id)?;
+            if !lifted.is_empty() {
+                self.tracker
+                    .comment(
+                        &node.id,
+                        &format!("owner failed — megafile blocks lifted: {}", lifted.join(", ")),
+                    )
+                    .await?;
+            }
             self.tracker.set_state(&node.id, NodeState::Failed).await?;
             self.cascade(&node).await?;
         }
@@ -692,14 +851,15 @@ impl Scheduler {
 
     async fn apply_planner_output(&mut self, node: Node, out: PlannerOutput) -> Result<()> {
         // Design decisions first: divergence detection is mechanism 2.
-        let existing = designdocs::load_all(&self.git.merge_dir())?;
-        let mut next = designdocs::next_number(&existing);
         let mut wrote_docs = false;
         for mut dd in out.design_decisions {
+            // Reload every iteration: an earlier decision from this same
+            // output must be visible to the next one's conflict detection.
+            let existing = designdocs::load_all(&self.git.merge_dir())?;
+            let next = designdocs::next_number(&existing);
             if let Some(conflict) = designdocs::find_conflict(&dd, &node.id, &existing) {
                 // Write the incoming doc under a fresh id, then reconcile.
                 dd.id = format!("DD-{next}");
-                next += 1;
                 designdocs::write_decision(&self.git.merge_dir(), &dd, &node.id)?;
                 wrote_docs = true;
                 self.spawn_reconciler(&node.id, conflict.meta.id.clone(), dd.clone())
@@ -709,7 +869,6 @@ impl Scheduler {
             // Renumber on plain id collisions (two planners both said DD-3).
             if existing.iter().any(|d| d.meta.id == dd.id) || !dd.id.starts_with("DD-") {
                 dd.id = format!("DD-{next}");
-                next += 1;
             }
             designdocs::write_decision(&self.git.merge_dir(), &dd, &node.id)?;
             wrote_docs = true;
@@ -746,6 +905,7 @@ impl Scheduler {
                     spec: child.spec.clone(),
                     agent,
                     depends_on,
+                    role_hint: None,
                     depth: node.depth + 1,
                     ready,
                 })
@@ -800,8 +960,6 @@ impl Scheduler {
                 )
                 .await?;
         }
-        // Flags are applied post-merge (Landed) so a node's own flag can't
-        // gate its own merge; stash them in retry_ctx-adjacent storage.
         if !out.flagged_files.is_empty() {
             self.tracker
                 .comment(
@@ -812,14 +970,19 @@ impl Scheduler {
         }
         match out.status {
             ExecStatus::Done => {
+                // Stash for merge time: a node's own flag must not gate its
+                // own merge, and the decomposer must split the file with this
+                // node's changes already landed. Breaks let a verify failure
+                // land + propagate (mechanism 5) instead of bouncing.
+                if !out.flagged_files.is_empty() {
+                    self.pending_flags.insert(node.id.clone(), out.flagged_files);
+                }
+                if !out.breaks.is_empty() {
+                    self.declared_breaks.insert(node.id.clone(), out.breaks);
+                }
                 self.tracker
                     .set_state(&node.id, NodeState::NeedsMerge)
                     .await?;
-                // Executor-reported flags join the scan at merge time via the
-                // comment trail; hard flags come from the post-merge scan.
-                for f in out.flagged_files {
-                    self.flag_and_decompose(&f).await?;
-                }
             }
             ExecStatus::Blocked => {
                 self.tracker.set_state(&node.id, NodeState::Failed).await?;
@@ -839,6 +1002,7 @@ impl Scheduler {
                         spec: node.spec.clone(),
                         agent: None,
                         depends_on: vec![],
+                        role_hint: None,
                         depth: node.depth,
                         ready: true,
                     })
@@ -867,6 +1031,7 @@ impl Scheduler {
                 ),
                 agent: Some(self.cfg.decomposer()),
                 depends_on: vec![],
+                role_hint: Some(Role::Decomposer),
                 depth: 1,
                 ready: true,
             })
@@ -889,8 +1054,21 @@ impl Scheduler {
         let refs_a =
             designdocs::files_referencing(&self.git.merge_dir(), &all_files, &incumbent_id);
         let incumbent = docs.iter().find(|d| d.meta.id == incumbent_id);
+        // Both planners' specs: the reconciler must see each side's intent,
+        // not just the two doc texts.
+        let incumbent_author = incumbent
+            .map(|d| d.meta.author_node.clone())
+            .unwrap_or_default();
+        let spec_a = match self.tracker.node(&incumbent_author).await {
+            Ok(n) => n.spec,
+            Err(_) => String::new(),
+        };
+        let spec_b = match self.tracker.node(author_node).await {
+            Ok(n) => n.spec,
+            Err(_) => String::new(),
+        };
         let conflict = format!(
-            "Two planners made contradictory decisions.\n\n### Doc A (incumbent, {} code references)\nid: {}\n{}\n\n### Doc B (incoming, 0 code references yet)\nid: {}\ntitle: {}\ntopics: {}\n\n{}",
+            "Two planners made contradictory decisions.\n\n### Doc A (incumbent, {} code references)\nid: {}\n{}\n\n### Doc B (incoming, 0 code references yet)\nid: {}\ntitle: {}\ntopics: {}\n\n{}\n\n### Planner A's work unit (authored doc A)\n{}\n\n### Planner B's work unit (authored doc B)\n{}",
             refs_a.len(),
             incumbent_id,
             incumbent.map(|d| d.body.as_str()).unwrap_or(""),
@@ -898,6 +1076,8 @@ impl Scheduler {
             incoming.title,
             incoming.topics.join(", "),
             incoming.content,
+            spec_a,
+            spec_b,
         );
         let fg = fieldguide::index_content(&self.git.merge_dir());
         let p = prompt::reconciler(&fg, &conflict);
@@ -912,18 +1092,19 @@ impl Scheduler {
             spec: String::new(),
             agent: None,
             depends_on: vec![],
+            role_hint: None,
             depth: 0,
             attempt: 1,
             claimed_at: None,
             updated_at: chrono::Utc::now(),
         };
-        let req = self.request(
-            &fake_node,
-            Role::Reconciler,
-            &agent_ref,
-            p,
-            self.git.merge_dir(),
-        );
+        // Reconcilers only read; give them a pinned snapshot, not the merge
+        // lane's checkout (the doc write happens harness-side on apply).
+        let workdir = self
+            .git
+            .create_snapshot(&format!("reconcile-{}", incoming.id), &self.run.branch)
+            .await?;
+        let req = self.request(&fake_node, Role::Reconciler, &agent_ref, p, workdir);
         let author = author_node.to_owned();
         let inc_id = incoming.id.clone();
         self.jobs.spawn(async move {
@@ -947,21 +1128,27 @@ impl Scheduler {
         incumbent_id: String,
         incoming_id: String,
     ) -> Result<()> {
+        self.git
+            .remove_snapshot(&format!("reconcile-{incoming_id}"))
+            .await
+            .ok();
         let inv = match res {
             Ok(inv) => {
                 self.record(&author_node, Role::Reconciler, &agent_ref, &inv, 1);
                 inv
             }
             Err(e) => {
-                tracing::error!("reconciler failed: {e:#} — keeping incumbent {incumbent_id}");
-                return Ok(());
+                tracing::error!("reconciler failed: {e:#} — incumbent {incumbent_id} stands");
+                return self.reconciler_default(&incumbent_id, &incoming_id).await;
             }
         };
         let parsed = agent::trailing_json(&inv.final_message)
             .and_then(|j| serde_json::from_str::<ReconcilerOutput>(j).ok());
         let Some(out) = parsed else {
-            tracing::error!("reconciler output unparseable — keeping incumbent {incumbent_id}");
-            return Ok(());
+            tracing::error!(
+                "reconciler output unparseable — incumbent {incumbent_id} stands"
+            );
+            return self.reconciler_default(&incumbent_id, &incoming_id).await;
         };
         let docs = designdocs::load_all(&self.git.merge_dir())?;
         let survivor_id = if out.surviving_id == incoming_id {
@@ -1009,9 +1196,25 @@ impl Scheduler {
                     ),
                     agent: None,
                     depends_on: vec![],
+                    role_hint: None,
                     depth: 1,
                     ready: true,
                 })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Reconciler failed: the incumbent (already-referenced) doc wins and the
+    /// incoming one is superseded — never leave two active contradicting docs.
+    async fn reconciler_default(&mut self, incumbent_id: &str, incoming_id: &str) -> Result<()> {
+        let docs = designdocs::load_all(&self.git.merge_dir())?;
+        if let Some(doc) = docs.iter().find(|d| d.meta.id == incoming_id) {
+            designdocs::mark_superseded(doc)?;
+            self.git
+                .harness_commit(&format!(
+                    "canopy: reconciler failed — {incoming_id} superseded, {incumbent_id} stands"
+                ))
                 .await?;
         }
         Ok(())
@@ -1035,6 +1238,19 @@ impl Scheduler {
                 self.tracker
                     .comment(&node.id, "no commits produced — nothing to merge")
                     .await?;
+                self.pending_flags.remove(&node.id);
+                self.declared_breaks.remove(&node.id);
+                // An empty decomposer landing lifts its block — the post-merge
+                // scan re-flags the file if it is still fat.
+                let lifted = self.blocklist.lift_for_node(&node.id)?;
+                if !lifted.is_empty() {
+                    self.tracker
+                        .comment(
+                            &node.id,
+                            &format!("megafile blocks lifted: {}", lifted.join(", ")),
+                        )
+                        .await?;
+                }
                 self.tracker.set_state(&node.id, NodeState::Done).await?;
                 self.git.remove_worktree(&node.id).await?;
                 self.cascade(&node).await?;
@@ -1057,12 +1273,20 @@ impl Scheduler {
                 self.fail_attempt(node, &format!("merge error: {e}"))
                     .await?;
             }
-            MergeReport::Landed { commit, megafiles } => {
+            MergeReport::Landed {
+                commit,
+                megafiles,
+                verify_debt,
+            } => {
                 self.tracker
                     .comment(&node.id, &format!("merged as {commit}"))
                     .await?;
                 self.git.remove_worktree(&node.id).await.ok();
-                // Post-merge megafile scan flags (mechanism 4).
+                // Executor-reported flags apply now that the node has landed,
+                // then the post-merge scan flags (mechanism 4).
+                for f in self.pending_flags.remove(&node.id).unwrap_or_default() {
+                    self.flag_and_decompose(&f).await?;
+                }
                 for f in megafiles {
                     self.flag_and_decompose(&f).await?;
                 }
@@ -1075,6 +1299,44 @@ impl Scheduler {
                             &format!("megafile blocks lifted: {}", lifted.join(", ")),
                         )
                         .await?;
+                }
+                // Mechanism 5: a declared break landed and verify now fails —
+                // the failure becomes fix work instead of a bounce.
+                if let Some(tail) = verify_debt {
+                    let breaks = self.declared_breaks.remove(&node.id).unwrap_or_default();
+                    let reasons = breaks
+                        .iter()
+                        .map(|b| format!("- {}: {}", b.file, b.reason))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.tracker
+                        .comment(
+                            &node.id,
+                            "verify failed after declared breaks — landed; propagating as a fix node",
+                        )
+                        .await?;
+                    self.tracker
+                        .create_node(NewNode {
+                            run_id: self.run.id.clone(),
+                            parent_id: node.parent_id.clone(),
+                            kind: NodeKind::Execute,
+                            title: format!("propagate break: {}", node.title),
+                            spec: format!(
+                                "The merged work unit \"{}\" made deliberate out-of-scope \
+                                 changes (canopy-break) and verify now fails.\n\nDeclared \
+                                 breaks:\n{reasons}\n\nVerify output tail:\n{tail}\n\nFix \
+                                 everything the break broke so verify passes.",
+                                node.title
+                            ),
+                            agent: None,
+                            depends_on: vec![],
+                            role_hint: None,
+                            depth: node.depth,
+                            ready: true,
+                        })
+                        .await?;
+                } else {
+                    self.declared_breaks.remove(&node.id);
                 }
                 self.tracker
                     .set_state(&node.id, NodeState::InReview)
@@ -1091,38 +1353,61 @@ impl Scheduler {
         agent_ref: AgentRef,
         res: Result<InvocationResult>,
     ) -> Result<()> {
-        let findings = match res {
+        let outcome = match res {
             Ok(inv) => {
                 self.record(&node.id, Role::Reviewer, &agent_ref, &inv, node.attempt);
-                agent::trailing_json(&inv.final_message)
+                match agent::trailing_json(&inv.final_message)
                     .and_then(|j| serde_json::from_str::<ReviewOutput>(j).ok())
-                    .map(|r| r.findings)
-                    .unwrap_or_else(|| {
-                        tracing::warn!(
-                            "reviewer ({}) output unparseable — treated as clean",
-                            lens.as_str()
-                        );
-                        Vec::new()
-                    })
+                {
+                    Some(r) => Ok(r.findings),
+                    None => Err("output unparseable".to_owned()),
+                }
             }
-            Err(e) => {
-                tracing::warn!("reviewer ({}) failed: {e:#} — lens skipped", lens.as_str());
-                Vec::new()
+            Err(e) => Err(format!("{e:#}")),
+        };
+        // A failed lens is counted, never treated as a clean pass.
+        let (findings, failed) = match outcome {
+            Ok(f) => (f, false),
+            Err(why) => {
+                self.tracker
+                    .comment(
+                        &node.id,
+                        &format!("review lens {} failed ({why}) — not counted", lens.as_str()),
+                    )
+                    .await?;
+                (Vec::new(), true)
             }
         };
         let Some(agg) = self.reviews.get_mut(&node.id) else {
             return Ok(());
         };
         agg.findings.extend(findings);
+        if failed {
+            agg.failed += 1;
+        }
         agg.pending -= 1;
         if agg.pending == 0 {
             let agg = self.reviews.remove(&node.id).unwrap();
+            if !self.cfg.routing.reviewers.is_empty()
+                && agg.failed == self.cfg.routing.reviewers.len()
+            {
+                self.tracker
+                    .comment(
+                        &node.id,
+                        "WARNING: ALL review lenses failed — this merge landed effectively unreviewed",
+                    )
+                    .await?;
+            }
             self.finish_review(node, agg.findings).await?;
         }
         Ok(())
     }
 
     async fn finish_review(&mut self, node: Node, findings: Vec<Finding>) -> Result<()> {
+        self.git
+            .remove_snapshot(&format!("review-{}", node.id))
+            .await
+            .ok();
         let highs: Vec<_> = findings
             .iter()
             .filter(|f| f.severity == Severity::High)
@@ -1163,6 +1448,7 @@ impl Scheduler {
                     ),
                     agent: None,
                     depends_on: vec![],
+                    role_hint: None,
                     depth: node.depth,
                     ready: true,
                 })
@@ -1178,11 +1464,20 @@ impl Scheduler {
         let Some(parent_id) = node.parent_id.clone() else {
             return Ok(()); // root: run_loop notices terminal state
         };
+        self.settle_parent(parent_id).await
+    }
+
+    /// If every child of `parent_id` is settled, decide the parent's fate:
+    /// replan (failures, cap left), Failed, or Done — then recurse upward.
+    async fn settle_parent(&mut self, parent_id: String) -> Result<()> {
         let children = self.tracker.children(&parent_id).await?;
-        let all_settled = children
-            .iter()
-            .all(|c| matches!(c.state, NodeState::Done | NodeState::Failed));
-        if !all_settled {
+        let all_settled = children.iter().all(|c| {
+            matches!(
+                c.state,
+                NodeState::Done | NodeState::Failed | NodeState::Superseded
+            )
+        });
+        if children.is_empty() || !all_settled {
             return Ok(());
         }
         let parent = self.tracker.node(&parent_id).await?;
@@ -1190,9 +1485,9 @@ impl Scheduler {
             return Ok(());
         }
         let any_failed = children.iter().any(|c| c.state == NodeState::Failed);
-        let replans = self.replans.entry(parent_id.clone()).or_insert(0);
-        if any_failed && *replans < REPLAN_CAP {
-            *replans += 1;
+        let used = *self.replans.get(&parent_id).unwrap_or(&0);
+        if any_failed && used < REPLAN_CAP {
+            self.replans.insert(parent_id.clone(), used + 1);
             let summary = children
                 .iter()
                 .map(|c| {
@@ -1212,6 +1507,14 @@ impl Scheduler {
                      children must not be redone.\n\nChildren outcomes:\n{summary}"
                 ),
             );
+            // Failed children are settled history now — supersede them so
+            // the replacement children alone decide the next cascade.
+            for c in children.iter().filter(|c| c.state == NodeState::Failed) {
+                self.tracker
+                    .set_state(&c.id, NodeState::Superseded)
+                    .await?;
+                self.tracker.comment(&c.id, "superseded by replan").await?;
+            }
             self.tracker
                 .comment(&parent_id, "children settled with failures — replanning")
                 .await?;
@@ -1236,6 +1539,22 @@ impl Scheduler {
         Box::pin(self.cascade(&parent)).await
     }
 
+    /// Board-state cascade sweep. The event cascade misses transitions this
+    /// process didn't write (a crash between a child's terminal write and the
+    /// parent update, a human settling issues on the board, dependents failed
+    /// by the tracker's unblock pass) — re-derive parent completion from
+    /// board state every tick.
+    async fn sweep_cascades(&mut self) -> Result<()> {
+        let parents = self
+            .tracker
+            .nodes_in_state(&self.run.id, NodeState::Decomposed)
+            .await?;
+        for p in parents {
+            Box::pin(self.settle_parent(p.id)).await?;
+        }
+        Ok(())
+    }
+
     /// Post-crash: InReview nodes lost their in-memory aggregation; they get
     /// re-reviewed from scratch by pump_reviews (idempotent — reviews are
     /// read-only and re-running lenses is cheap by design).
@@ -1245,10 +1564,10 @@ impl Scheduler {
 }
 
 fn node_role(node: &Node) -> Role {
-    match node.kind {
+    node.role_hint.unwrap_or(match node.kind {
         NodeKind::Plan => Role::Planner,
         NodeKind::Execute => Role::Executor,
-    }
+    })
 }
 
 fn kind_str(k: NodeKind) -> &'static str {
@@ -1267,6 +1586,7 @@ async fn merge_job(
     cfg: Arc<Config>,
     node: Node,
     run_branch: String,
+    breaks: Vec<BreakNote>,
 ) -> (MergeReport, Vec<(AgentRef, InvocationResult)>) {
     let git = GitOps::new(&cfg.run.repo);
     let mut merger_runs = Vec::new();
@@ -1283,12 +1603,13 @@ async fn merge_job(
             MergeOutcome::Merged { commit } => commit,
             MergeOutcome::Conflicted { details } => {
                 // Mechanism 3: the neutral Merger.
+                let recent = git.recent_subjects(5).await.unwrap_or_default();
                 let mut resolved = false;
                 for _try in 0..MERGER_MAX_TRIES {
                     let hunks = git.conflict_hunks().await.unwrap_or(details.clone());
                     let conflict = format!(
-                        "Node \"{}\" (spec below) conflicts with the current run branch.\n\n### Node spec\n{}\n\n### Conflicted hunks\n{}",
-                        node.title, node.spec, hunks
+                        "Node \"{}\" (spec below) conflicts with the current run branch.\n\n### Node spec\n{}\n\n### Recent landings on the run branch (the other side)\n{}\n\n### Conflicted hunks\n{}",
+                        node.title, node.spec, recent, hunks
                     );
                     let fg = fieldguide::index_content(&git.merge_dir());
                     let docs = designdocs::load_all(&git.merge_dir())?;
@@ -1309,8 +1630,14 @@ async fn merge_job(
                     match agent::for_ref(&agent_ref).invoke(&req).await {
                         Ok(inv) => {
                             let ok = inv.exit_ok;
+                            let parsed = agent::trailing_json(&inv.final_message)
+                                .and_then(|j| serde_json::from_str::<MergerOutput>(j).ok());
                             merger_runs.push((agent_ref, inv));
-                            if ok && git.merge_resolved().await? {
+                            // The Merger's own verdict counts: an explicit
+                            // resolved=false is a failure even if git looks
+                            // clean. Git state remains the positive gate.
+                            let declined = parsed.map(|o| !o.resolved).unwrap_or(false);
+                            if ok && !declined && git.merge_resolved().await? {
                                 resolved = true;
                                 break;
                             }
@@ -1326,59 +1653,100 @@ async fn merge_job(
             }
         };
 
-        // --- Post-merge gates, in bounce-cheapest order ---
-        // Mechanism 7: field guide line budget.
-        if let Some(lines) = fieldguide::over_budget(&git.merge_dir(), cfg.thresholds.fieldguide_line_budget)
-        {
-            git.revert_merge(&commit).await?;
-            return Ok(MergeReport::Bounced {
-                reason: format!(
-                    "fieldguide/index.md is {lines} lines (budget {}) — curate before adding",
-                    cfg.thresholds.fieldguide_line_budget
-                ),
-            });
+        // Post-merge gates: any ERROR from here on must revert the landed
+        // commit — otherwise the retry sees "nothing to merge" and the work
+        // lands unverified and unreviewed.
+        match post_merge_gates(&cfg, &git, &commit, &files, &breaks).await {
+            Ok(report) => Ok(report),
+            Err(e) => {
+                if let Err(rev) = git.revert_merge(&commit).await {
+                    tracing::error!("revert after gate error failed: {rev:#}");
+                }
+                Err(e)
+            }
         }
-        // Mechanism 1: checked design references (only files this node touched).
-        let docs = designdocs::load_all(&git.merge_dir())?;
-        let refs = designdocs::scan_refs(&git.merge_dir(), &files);
-        let violations = designdocs::check_refs(&refs, &docs);
-        if !violations.is_empty() {
-            git.revert_merge(&commit).await?;
-            return Ok(MergeReport::Bounced {
-                reason: format!("design reference check failed:\n{}", violations.join("\n")),
-            });
-        }
-        // Ground truth: the verify command (also propagates declared breaks).
-        let verify = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cfg.run.verify)
-            .current_dir(git.merge_dir())
-            .output()
-            .await?;
-        if !verify.status.success() {
-            let tail = |b: &[u8]| -> String {
-                let s = String::from_utf8_lossy(b);
-                s.chars().skip(s.chars().count().saturating_sub(1500)).collect()
-            };
-            git.revert_merge(&commit).await?;
-            return Ok(MergeReport::Bounced {
-                reason: format!(
-                    "verify failed:\n{}\n{}",
-                    tail(&verify.stdout),
-                    tail(&verify.stderr)
-                ),
-            });
-        }
-        // Mechanism 4: megafile scan.
-        let megafiles = git
-            .megafile_scan(cfg.thresholds.megafile_lines)
-            .await?
-            .into_iter()
-            .map(|(f, _)| f)
-            .collect();
-        Ok::<MergeReport, anyhow::Error>(MergeReport::Landed { commit, megafiles })
     }
     .await
     .unwrap_or_else(|e: anyhow::Error| MergeReport::Error(format!("{e:#}")));
     (report, merger_runs)
+}
+
+/// Everything between "the merge commit exists" and "it may stay": field
+/// guide budget, design-ref check, verify (with mechanism-5 break landing),
+/// megafile scan. Bounces revert the commit themselves; hard errors are the
+/// caller's to revert.
+async fn post_merge_gates(
+    cfg: &Config,
+    git: &GitOps,
+    commit: &str,
+    files: &[String],
+    breaks: &[BreakNote],
+) -> Result<MergeReport> {
+    // Mechanism 7: field guide line budget.
+    if let Some(lines) =
+        fieldguide::over_budget(&git.merge_dir(), cfg.thresholds.fieldguide_line_budget)
+    {
+        git.revert_merge(commit).await?;
+        return Ok(MergeReport::Bounced {
+            reason: format!(
+                "fieldguide/index.md is {lines} lines (budget {}) — curate before adding",
+                cfg.thresholds.fieldguide_line_budget
+            ),
+        });
+    }
+    // Mechanism 1: checked design references (files this node touched; the
+    // supersede path is covered by the reconciler's fix nodes).
+    let docs = designdocs::load_all(&git.merge_dir())?;
+    let refs = designdocs::scan_refs(&git.merge_dir(), files);
+    let violations = designdocs::check_refs(&refs, &docs);
+    if !violations.is_empty() {
+        git.revert_merge(commit).await?;
+        return Ok(MergeReport::Bounced {
+            reason: format!("design reference check failed:\n{}", violations.join("\n")),
+        });
+    }
+    // Ground truth: the verify command.
+    let verify = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cfg.run.verify)
+        .current_dir(git.merge_dir())
+        .output()
+        .await?;
+    let megafiles = || async {
+        Ok::<Vec<String>, anyhow::Error>(
+            git.megafile_scan(cfg.thresholds.megafile_lines)
+                .await?
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect(),
+        )
+    };
+    if !verify.status.success() {
+        let tail = |b: &[u8]| -> String {
+            let s = String::from_utf8_lossy(b);
+            s.chars()
+                .skip(s.chars().count().saturating_sub(1500))
+                .collect()
+        };
+        let out = format!("{}\n{}", tail(&verify.stdout), tail(&verify.stderr));
+        if !breaks.is_empty() {
+            // Mechanism 5: a declared break lands anyway; the verify failure
+            // propagates as fix work (the article's compiler role).
+            return Ok(MergeReport::Landed {
+                commit: commit.to_owned(),
+                megafiles: megafiles().await?,
+                verify_debt: Some(out),
+            });
+        }
+        git.revert_merge(commit).await?;
+        return Ok(MergeReport::Bounced {
+            reason: format!("verify failed:\n{out}"),
+        });
+    }
+    // Mechanism 4: megafile scan.
+    Ok(MergeReport::Landed {
+        commit: commit.to_owned(),
+        megafiles: megafiles().await?,
+        verify_debt: None,
+    })
 }
