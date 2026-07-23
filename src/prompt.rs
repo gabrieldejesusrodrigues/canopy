@@ -130,6 +130,7 @@ pub fn reviewer(
     diff: &str,
     transcript: Option<&str>,
     touched_files: &[String],
+    touched_contents: &str,
 ) -> String {
     let contract = match lens {
         Lens::Transcript => REVIEWER_TRANSCRIPT,
@@ -139,9 +140,15 @@ pub fn reviewer(
     let files = touched_files.join("\n");
     let sections: Vec<(&str, &str)> = match lens {
         // Codebase lens deliberately sees no diff/history — only the repo it
-        // sits in (its worktree), what unit was requested, and which files
-        // that unit touched (so it knows where to look).
-        Lens::Codebase => vec![("WORK UNIT", spec), ("FILES", &files)],
+        // sits in (its worktree), what unit was requested, which files that
+        // unit touched, and their full bodies pushed inline so it need not
+        // re-read them turn after turn (that re-acquisition was the lens's
+        // dominant cost). An empty FILE CONTENTS section is skipped by assemble.
+        Lens::Codebase => vec![
+            ("WORK UNIT", spec),
+            ("FILES", &files),
+            ("FILE CONTENTS", touched_contents),
+        ],
         Lens::Output => vec![("WORK UNIT", spec), ("DIFF", diff)],
         Lens::Transcript => vec![
             ("WORK UNIT", spec),

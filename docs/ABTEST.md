@@ -204,6 +204,64 @@ clean StorageError. Craft and blind spots are orthogonal; neither lens caught it
 user-facing behavior tied), cost edge to nobody. At this width, pick leaves for quality,
 not price; the price argument only turns on when leaves outnumber coordination.
 
+### Root cause: the gap was in the spec, not the leaf
+
+The article's thesis is that *"once a frontier planner has collapsed the ambiguity into a
+detailed, explicit instruction, less expensive models simply have to follow it."* So the
+right question about the two probe losses above is not "is sonnet weaker?" but "did the
+trunk actually collapse the ambiguity?" We pulled the two arms' `query.py` specs off their
+boards to check. Both arms were planned by the **same opus trunk**; both foundations
+exposed a shared date validator (A5's `validate_date`, B5's `parse_date`). The specs
+diverged:
+
+- **A5 (→ sonnet leaf)** on date handling: *"compare them as strings OR via
+  `datetime.date.fromisoformat` … but if you parse, guard is unnecessary since stored
+  dates are valid."* Two options, and an explicit licence to skip the guard. It never told
+  the leaf to run the untrusted `--due-before` CLI value through `validate_date`. The
+  sonnet leaf followed the spec faithfully — including its permission to not validate.
+- **B5 (→ opus leaf)** on the same: *"Compare dates via `models.parse_date` (parse both
+  sides to `datetime.date`)."* One canonical path, through the shared validator that
+  raises on bad input. The opus leaf followed that too — hence exit 2.
+
+So the two probe wins were **not** the leaf model being smarter; they were the spec being
+more explicit for that arm. The same planner produced a laxer spec for the routed run, and
+the leaf inherited the laxity. Compounding it: A5 split tests into two **test-only leaves**
+(7 leaves total), so the implementer of `query.py` never wrote the tests that would have
+forced it to confront the `--due-before` edge case; B5's leaves each owned their own tests
+(5 leaves), so B5's query author met the edge case while writing `test_query.py`. The
+test-only split cost the extra landings *and* removed the pressure that produces the craft.
+
+**The quality lever and the cost lever are the same lever: trunk decomposition.** Fewer,
+fuller, test-owning leaves = fewer cold starts + merges + review landings (cost is
+O(width)) *and* implementers who meet their own edge cases (quality).
+
+### Fixes shipped (this session)
+
+Prompt and harness changes targeting exactly the above:
+
+1. **`planner.md` — "Collapse the ambiguity".** A spec has uncollapsed ambiguity when it
+   offers a choice, calls a check optional/unnecessary, names a behavior without its
+   boundary conditions, or relies on a shared helper without naming it. Untrusted input
+   must be validated at the boundary through a *named* shared validator, recorded as a
+   design decision. This directly forbids the exact A5 spec language ("guard is
+   unnecessary", "strings OR fromisoformat").
+2. **`planner.md` — "Decomposition economics".** Prefer fewer, fuller children; **each
+   child owns its module AND that module's tests**; **no test-only children**; shared
+   utilities live in one foundation child imported by name. Kills the 7-vs-5 width
+   regression at its source.
+3. **`executor.md` — craft bar.** Call the shared helpers your spec names (never
+   reimplement/bypass); validate untrusted input before mutating state; cover the edge
+   cases your assigned tests list.
+4. **Push-context codebase lens (cost).** The round-4 prompt-only "scope your reading"
+   nudge measurably failed ($0.124/call, unchanged). Replaced with a mechanism: the
+   harness now injects the touched files' full bodies into the codebase-lens prompt
+   (bounded 48 KB) and caps that lens at 8 turns, so it judges from context instead of
+   re-reading the repo every turn (that re-acquisition was its dominant cost). Effect to
+   be measured in a round 6.
+
+These are unmeasured until a round 6 A/B repeats the taskflow objective; the diagnosis
+(same planner, laxer spec → laxer leaf) is the evidence-backed part.
+
 ## Crash recovery, validated in anger
 
 The A2 daemon was killed by the host mid-run (leaf claimed, work half-done). Twenty-five

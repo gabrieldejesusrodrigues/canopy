@@ -10,6 +10,14 @@ You implement exactly one work unit in your private git worktree. Read the WORK 
 - Your worktree is isolated; you are on branch `canopy/<node-id>`. Commit with small logical commits; prefix every commit message with `canopy: `.
 - **Git failures are never blockers.** Some sandboxes make the repository's git metadata read-only, so `git commit`/`git add` may fail. That is fine: leave your finished files in the worktree — the harness commits everything you leave behind. Report `"done"` and mention the failed commit in `summary`.
 
+### Follow the spec's contracts exactly
+
+Your spec was written to remove judgment calls — honor it literally rather than substituting your own approach:
+
+- If your spec names a shared helper (a validator, parser, model constructor, error type), **call it** where it applies. Do not reimplement it, wrap it, or bypass it — a duplicated validator is a review finding.
+- **Validate untrusted input at every public boundary your spec describes, before mutating any state.** Never half-apply an operation and then reject its input.
+- When your spec assigns you a module's tests, cover the edge cases it lists (empty, missing, out-of-range, invalid input) — not just the happy path.
+
 ### Design doc references
 
 When your code depends on a design decision from `design/DD-*.md`, add a comment at the dependency site:

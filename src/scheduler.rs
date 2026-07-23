@@ -446,6 +446,47 @@ impl Scheduler {
                     continue;
                 }
             };
+            // Push the touched files' bodies into the codebase lens so it
+            // judges from the prompt instead of re-reading the repo turn after
+            // turn — that re-acquisition was the lens's dominant cost. Bounded;
+            // past the cap the lens falls back to reading from the snapshot.
+            // Built only when a codebase lens is actually configured.
+            let touched_contents = if self
+                .cfg
+                .routing
+                .reviewers
+                .iter()
+                .any(|r| r.lens == Lens::Codebase)
+            {
+                const CAP: usize = 48 * 1024;
+                let mut s = String::new();
+                for f in &touched {
+                    if s.len() >= CAP {
+                        break;
+                    }
+                    let Ok(body) = std::fs::read_to_string(snap.join(f)) else {
+                        continue;
+                    };
+                    s.push_str(&format!("--- FILE: {f} ---\n"));
+                    let remaining = CAP.saturating_sub(s.len());
+                    if body.len() > remaining {
+                        let mut end = remaining.min(body.len());
+                        while end > 0 && !body.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        s.push_str(&body[..end]);
+                        s.push_str("\n… (truncated; read the rest from the worktree)\n");
+                    } else {
+                        s.push_str(&body);
+                        if !body.ends_with('\n') {
+                            s.push('\n');
+                        }
+                    }
+                }
+                s
+            } else {
+                String::new()
+            };
             self.reviews.insert(
                 node.id.clone(),
                 ReviewAgg {
@@ -466,6 +507,7 @@ impl Scheduler {
                     &diff,
                     transcript.as_deref(),
                     &touched,
+                    &touched_contents,
                 );
                 let mut req =
                     self.request(&node, Role::Reviewer, &agent_ref, p, snap.clone());
@@ -479,8 +521,12 @@ impl Scheduler {
                 ));
                 // Reviews are one read-and-report pass; the executor turn
                 // budget would let a lens wander the repo on the meter
-                // ("reviewing is far cheaper than the work being audited").
-                req.max_turns = Some(req.max_turns.map_or(20, |t| t.min(20)));
+                // ("reviewing is far cheaper than the work being audited"). The
+                // codebase lens already has the touched bodies pushed inline, so
+                // it needs only a few turns to spot-check imports/DDs — cap it
+                // tighter than the diff/transcript lenses.
+                let cap = if rc.lens == Lens::Codebase { 8 } else { 20 };
+                req.max_turns = Some(req.max_turns.map_or(cap, |t| t.min(cap)));
                 let node_c = node.clone();
                 let lens = rc.lens;
                 let ar = agent_ref.clone();

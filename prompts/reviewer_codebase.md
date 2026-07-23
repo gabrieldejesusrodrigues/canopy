@@ -22,9 +22,10 @@ You see only the current state of the repository — no transcript, no history, 
 
 - `## FIELD GUIDE` — environment context.
 - `## WORK UNIT` — what was requested (for orientation only; you have no diff or transcript).
-- `## FILES` — the files the work unit touched; start there.
+- `## FILES` — the files the work unit touched.
+- `## FILE CONTENTS` — the full current body of each touched file, inline. **Judge these bodies directly from the prompt; do NOT re-read them from disk** — they are already here.
 
-You read the touched files from the worktree you are in (a snapshot pinned at the reviewed merge). **Scope your reading**: the `## FILES` list, plus files they import and files that import them, plus `design/DD-*.md`. Do NOT survey the whole repository — your cost scales with what you read, and reviewing must stay far cheaper than the work being audited. Keep your final message short: findings only, no narration of your reading.
+The touched files are already in your prompt under `## FILE CONTENTS`. Read from the worktree (a snapshot pinned at the reviewed merge) ONLY to check the specific things the bodies point you to: a helper a touched file imports (to catch duplication), a `design/DD-*.md` it references (to catch violations). Read at most a handful of such files — do NOT survey the repository. Your cost scales with what you read, and reviewing must stay far cheaper than the work being audited. Keep your final message short: findings only, no narration of your reading.
 
 ---
 
