@@ -262,6 +262,67 @@ Prompt and harness changes targeting exactly the above:
 These are unmeasured until a round 6 A/B repeats the taskflow objective; the diagnosis
 (same planner, laxer spec → laxer leaf) is the evidence-backed part.
 
+## Round 6 — the fixes, measured
+
+Same taskflow objective, fresh repos, the round-5 configs verbatim (only the executor
+model differs between arms), run on the harness *after* the collapse-ambiguity +
+decomposition-economics prompt changes and the push-context codebase lens.
+
+| arm | leaves | cost | wall | tests | battery |
+|---|---|---|---|---|---|
+| A6: opus trunk + **sonnet** leaves | 4 | **$2.50** | 9.1 min | 70 | ✅ 23/23 |
+| B6: **opus everywhere** | 6 | **$3.85** | 9.4 min | 117 | ✅ 23/23 |
+
+**The cost verdict flipped.** In round 5 the routed arm cost 5% *more* than
+opus-everywhere ($3.68 vs $3.50); now it costs **35% less** ($2.50 vs $3.85). Two drivers,
+both the shipped fixes:
+
+- **Decomposition economics.** The A6 planner emitted 4 fuller leaves, each owning its
+  own module *and* tests — no test-only children — versus A5's 7 (2 of them test-only).
+  Cost is O(width): fewer leaves = fewer cold starts, merges, and review landings. (B6's
+  planner happened to pick 6; decomposition is still nondeterministic, but the prompt now
+  pushes toward "fewer, fuller.")
+- **Push-context codebase lens.** Per-call cost of the haiku codebase lens fell from
+  **$0.124** (round 5) to **$0.062–0.067**, and its cached repo re-reads fell from ~365 K
+  per call to ~33 K — an ~11× drop. The round-4 prompt-only "scope your reading" nudge
+  hadn't moved this number at all; pushing the touched-file bodies into the prompt and
+  capping the lens at 8 turns did.
+
+### Quality: the round-5 gaps closed
+
+The two runtime probes that separated the arms in round 5 were input-validation on
+untrusted CLI values. This round both arms handle them:
+
+| probe | A5 sonnet (r5) | A6 sonnet (r6) | B6 opus (r6) |
+|---|---|---|---|
+| `task list --due-before 2026-99-99` | exit 0, silent | **exit 2** ✓ | exit 2 ✓ |
+| `report --today <garbage>` | exit 0, silent | **exit 2** ✓ | exit 2 ✓ |
+| state file = valid JSON, non-dict | exit 2 ✓ | exit 2 ✓ | **exit 2 ✓** (r5 opus crashed) |
+| `--status bogus` (list filter) | silent empty | silent empty | argparse rejects |
+
+A6's `filter_tasks` now opens with `models.parse_date(due_before)` — the leaf validated the
+untrusted input because the spec named the shared validator and forbade a private date
+parser, where A5's spec had offered *"strings OR fromisoformat… guard is unnecessary."*
+**Same leaf model as round 5; the only thing that changed was the trunk's spec.** That is
+the article's thesis reproduced on demand.
+
+Both arms pass the full 23-check battery and their whole unittest suite (A6 70 tests /
+1,018 LOC; B6 117 / 1,549). Review-finding severity actually favored the sonnet arm this
+round: A6 drew only *low* findings (missing `canopy-design:` ref comments), while B6's opus
+leaves drew two *high* findings (test files importing `errors` directly, against the spec's
+import rule) that the review loop then fixed. Zero merge conflicts, zero retries, zero
+failed nodes in both arms.
+
+### The lever
+
+Round 5 said "at small width, tree shape dominates leaf price." Round 6 shows the
+corollary: **improve the trunk and both levers move at once.** The planner change made the
+sonnet leaf validate (quality) *and* cut the leaf count (cost); the lens change cut review
+cost without blinding it. Routed-swarm now beats opus-everywhere on cost at this scale and
+ties it on user-facing quality — the shape the article promised, at bonsai scale. n=1 per
+arm, so decomposition nondeterminism could shift the exact percentages on a repeat; the
+probe-level quality closure and the per-call lens cost drop are mechanism-level, not luck.
+
 ## Crash recovery, validated in anger
 
 The A2 daemon was killed by the host mid-run (leaf claimed, work half-done). Twenty-five
