@@ -199,13 +199,15 @@ src/config.rs      canopy.toml (routing, budgets, verify, thresholds, tracker)
 src/model.rs       NodeKind, NodeState, Role, Node, Run
 src/tracker/       mod.rs (trait) + sqlite.rs + linear.rs
 src/agent/         mod.rs (AgentCli trait) + claude.rs + codex.rs + agy.rs + stub.rs
-src/gitops.rs      worktrees, branches, merges, line-count scan
-src/scheduler.rs   the loop (§3)
-src/mechanisms/    designdocs.rs, megafile.rs, fieldguide.rs, review.rs
+src/gitops.rs      worktrees, branches, merge plumbing, rerere, line-count scan
+src/scheduler.rs   the loop (§3): claiming, applying, reviews, cascade/replan
+src/mergelane.rs   the serialized merge job: resolution ladder (rerere →
+                   triage → merger), post-merge gates, escalation
+src/mechanisms/    designdocs.rs, megafile.rs, fieldguide.rs
 src/ledger.rs      costs + report
 src/prompt.rs      contract assembly (role md ⊕ field guide ⊕ spec ⊕ design docs)
 prompts/*.md       role contracts (embedded via include_str!)
-tests/e2e_stub.rs  the smoke test (§9)
+src/e2e.rs         the stub-agent smoke test (§9)
 ```
 
 First run against a target repo scaffolds `design/`, `fieldguide/index.md` and

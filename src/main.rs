@@ -5,6 +5,7 @@ mod e2e;
 mod gitops;
 mod ledger;
 mod mechanisms;
+mod mergelane;
 mod model;
 mod prompt;
 mod scheduler;
