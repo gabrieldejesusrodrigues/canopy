@@ -108,6 +108,21 @@ pub fn parse_events(jsonl: &str) -> ParsedEvents {
     }
 }
 
+/// For a git worktree checkout, `<workdir>/.git` is a FILE reading
+/// `gitdir: <main>/.git/worktrees/<id>`. Returns the main `.git` dir so the
+/// sandbox can be granted write access to it. None for non-worktrees.
+fn worktree_git_dir(workdir: &std::path::Path) -> Option<String> {
+    let dotgit = workdir.join(".git");
+    if !dotgit.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&dotgit).ok()?;
+    let gitdir = content.strip_prefix("gitdir:")?.trim();
+    let marker = "/.git/";
+    let idx = gitdir.find(marker)?;
+    Some(gitdir[..idx + marker.len() - 1].to_owned())
+}
+
 #[async_trait]
 impl AgentCli for CodexCli {
     fn kind(&self) -> CliKind {
@@ -132,7 +147,19 @@ impl AgentCli for CodexCli {
             .arg(&req.workdir)
             .arg("--skip-git-repo-check")
             .arg("-s")
-            .arg("workspace-write")
+            .arg("workspace-write");
+        // A git *worktree*'s metadata lives outside the workdir (in the main
+        // repo's .git/worktrees/<id>), which workspace-write leaves read-only
+        // — `git commit` fails inside the sandbox. Grant the main .git dir.
+        // Unknown -c keys are ignored by codex, so this degrades safely (the
+        // harness commits leftover work either way).
+        if let Some(gitdir) = worktree_git_dir(&req.workdir) {
+            cmd.arg("-c").arg(format!(
+                "sandbox_workspace_write.writable_roots=[{:?}]",
+                gitdir
+            ));
+        }
+        cmd
             .arg("--ignore-user-config")
             .arg("--ephemeral")
             .arg("-o")

@@ -72,6 +72,9 @@ impl GitOps {
     /// An existing merge worktree may be left over from a previous run: clear
     /// any in-progress merge (crash recovery) and re-point it at this branch.
     pub async fn ensure_run_branch(&self, branch: &str) -> Result<()> {
+        // Deleting .canopy/ is the documented reset; clear the stale
+        // registrations that leaves behind.
+        let _ = self.git(&["worktree", "prune"]).await;
         let exists = self
             .git(&["rev-parse", "--verify", "--quiet", branch])
             .await

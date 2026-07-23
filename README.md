@@ -54,6 +54,7 @@ prompt; agents curate it; the only rule is a line budget — enforced at merge t
 
 Full mapping with quotes and triggers: [docs/MECHANISMS.md](docs/MECHANISMS.md).
 Architecture: [docs/DESIGN.md](docs/DESIGN.md).
+First real run (real CLIs, real tokens, article-shaped economics): [docs/REALRUN.md](docs/REALRUN.md).
 
 ## Install
 

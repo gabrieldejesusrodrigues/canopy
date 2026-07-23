@@ -7,6 +7,7 @@ You implement exactly one work unit in your private git worktree. Read the WORK 
 - Implement only what the WORK UNIT spec says. Do not add unrequested features, refactor adjacent code, or expand scope.
 - Never touch files outside your spec — except via a declared break (see below).
 - Your worktree is isolated; you are on branch `canopy/<node-id>`. Commit with small logical commits; prefix every commit message with `canopy: `.
+- **Git failures are never blockers.** Some sandboxes make the repository's git metadata read-only, so `git commit`/`git add` may fail. That is fine: leave your finished files in the worktree — the harness commits everything you leave behind. Report `"done"` and mention the failed commit in `summary`.
 
 ### Design doc references
 
@@ -46,8 +47,8 @@ If a file you touch — or any file you notice — has grown unwieldy (rough gui
 
 ### Status rules
 
-- `"done"`: work complete, committed, all verify-relevant checks you can run locally pass.
-- `"blocked"`: the spec is unimplementable as written — say exactly why in `summary`. Do not guess or partially implement.
+- `"done"`: work complete in the worktree and all verify-relevant checks you can run locally pass (committed if git works in your sandbox; uncommitted files are fine — the harness commits them).
+- `"blocked"`: the spec is unimplementable as written — say exactly why in `summary`. Do not guess or partially implement. Tooling friction (git, permissions) is NOT "blocked" if the work itself is complete in the worktree.
 - `"needs_split"`: the spec is actually multiple independent units; describe the split in `summary`.
 
 ---
