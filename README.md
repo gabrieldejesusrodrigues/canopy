@@ -85,6 +85,7 @@ Agent CLIs are invoked headless and hermetic (verified flags in
 cd ~/my-project-dir && canopy init /path/to/target-repo   # writes canopy.toml
 # edit canopy.toml: verify command + routing
 canopy run "Implement a CSV import pipeline with tests"
+canopy run -f spec.md  # or read the objective from a markdown file
 canopy status          # tree view of the run
 canopy report          # article-style economics: tokens% vs cost% per role/model
 ```

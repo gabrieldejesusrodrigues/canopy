@@ -41,8 +41,11 @@ enum Cmd {
     },
     /// Start (or resume) a swarm run
     Run {
-        /// The objective for the root planner
+        /// The objective for the root planner (or use --file)
         objective: Option<String>,
+        /// Read the objective from a file (e.g. a markdown spec) instead of the argument
+        #[arg(short, long)]
+        file: Option<PathBuf>,
         /// Resume a paused/crashed run by id
         #[arg(long)]
         resume: Option<String>,
@@ -73,8 +76,22 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Init { repo } => init(repo),
-        Cmd::Run { objective, resume } => {
+        Cmd::Run {
+            objective,
+            file,
+            resume,
+        } => {
             let cfg = config::Config::load(&cli.config)?;
+            let objective = match (objective, file) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("pass either an objective argument or --file, not both")
+                }
+                (obj, None) => obj,
+                (None, Some(path)) => Some(
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading objective file {}", path.display()))?,
+                ),
+            };
             scheduler::Scheduler::start(cfg, objective, resume).await
         }
         Cmd::Status { run, watch } => {
